@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     steps:
@@ -28,29 +28,37 @@ jobs:
           echo "--- anything left mentioning wayland or x11 ---"
           grep -rn --include=Cargo.toml -E "wayland|x11" . || true
 
-      - name: Create iPad file dialog (uses the app Documents folder)
+      - name: Create iPad file dialog replacement (picker version and simple version)
         run: |
-          mkdir -p "$HOME/rfd-stub/src"
-          cat > "$HOME/rfd-stub/Cargo.toml" <<'EOF'
+          mkdir -p "$HOME/rfd-picker/src" "$HOME/rfd-simple/src"
+          cat > "$HOME/rfd-picker/Cargo.toml" <<'EOF'
           [package]
           name = "rfd"
           version = "0.17.2"
           edition = "2021"
-          description = "iPad replacement: files live in the app Documents folder"
+          description = "iPad replacement for the file dialog library"
 
           [features]
-          default = []
+          default = ["picker"]
+          picker = ["dep:objc2"]
           xdg-portal = []
           gtk3 = []
           tokio = []
           async-std = []
           common-controls-v6 = []
           file-handle-inner = []
+
+          [dependencies]
+          objc2 = { version = "0.5.2", optional = true }
           EOF
-          cat > "$HOME/rfd-stub/src/lib.rs" <<'EOF'
+          sed 's/default = \["picker"\]/default = []/' "$HOME/rfd-picker/Cargo.toml" > "$HOME/rfd-simple/Cargo.toml"
+          cat > "$HOME/rfd-picker/src/lib.rs" <<'EOF'
           //! iPad replacement for the rfd crate.
-          //! Open: picks the newest matching file in the app Documents folder.
-          //! Save: writes into the app Documents folder.
+          //! Picker version: opens the Files app picker (pick, then tap Open or Save again).
+          //! Simple version: uses the app Documents folder.
+          #![allow(dead_code)]
+          #![allow(unused_imports)]
+
           use std::future::Future;
           use std::path::{Path, PathBuf};
 
@@ -108,7 +116,7 @@ jobs:
               best.map(|(_, p)| p)
           }
 
-          fn save_path(name: &str, exts: &[String]) -> PathBuf {
+          fn save_name(name: &str, exts: &[String]) -> String {
               let exts = clean_exts(exts);
               let mut name = if name.trim().is_empty() {
                   "Untitled".to_string()
@@ -120,7 +128,214 @@ jobs:
                       name = format!("{}.{}", name, first);
                   }
               }
-              docs_dir().join(name)
+              name
+          }
+
+          #[cfg(feature = "picker")]
+          mod ios_picker {
+              use objc2::declare::ClassBuilder;
+              use objc2::runtime::{AnyClass, AnyObject, Sel};
+              use objc2::{class, msg_send, sel};
+              use std::ffi::{CStr, CString};
+              use std::os::raw::c_char;
+              use std::path::PathBuf;
+              use std::sync::atomic::{AtomicBool, Ordering};
+              use std::sync::{Mutex, OnceLock};
+
+              pub static PENDING_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+              pub static PENDING_FOLDER: Mutex<Option<PathBuf>> = Mutex::new(None);
+              static FOLDER_MODE: AtomicBool = AtomicBool::new(false);
+              static DELEGATE: OnceLock<usize> = OnceLock::new();
+
+              fn store(path: PathBuf) {
+                  if FOLDER_MODE.load(Ordering::SeqCst) {
+                      *PENDING_FOLDER.lock().unwrap() = Some(path);
+                  } else {
+                      *PENDING_FILE.lock().unwrap() = Some(path);
+                  }
+              }
+
+              extern "C" fn did_pick(_this: &AnyObject, _cmd: Sel, _picker: *mut AnyObject, urls: *mut AnyObject) {
+                  unsafe {
+                      if urls.is_null() {
+                          return;
+                      }
+                      let count: usize = msg_send![urls, count];
+                      if count == 0 {
+                          return;
+                      }
+                      let url: *mut AnyObject = msg_send![urls, objectAtIndex: 0usize];
+                      if url.is_null() {
+                          return;
+                      }
+                      let _started: bool = msg_send![url, startAccessingSecurityScopedResource];
+                      let _kept: *mut AnyObject = msg_send![url, retain];
+                      let path_obj: *mut AnyObject = msg_send![url, path];
+                      if path_obj.is_null() {
+                          return;
+                      }
+                      let utf8: *const c_char = msg_send![path_obj, UTF8String];
+                      if utf8.is_null() {
+                          return;
+                      }
+                      let path = CStr::from_ptr(utf8).to_string_lossy().into_owned();
+                      store(PathBuf::from(path));
+                  }
+              }
+
+              extern "C" fn cancelled(_this: &AnyObject, _cmd: Sel, _picker: *mut AnyObject) {}
+
+              unsafe fn delegate() -> *mut AnyObject {
+                  let addr = *DELEGATE.get_or_init(|| {
+                      unsafe {
+                          let mut builder = ClassBuilder::new("DeckCraftPickerDelegate", class!(NSObject))
+                              .expect("picker delegate class");
+                          builder.add_method(
+                              sel!(documentPicker:didPickDocumentsAtURLs:),
+                              did_pick as extern "C" fn(_, _, _, _),
+                          );
+                          builder.add_method(
+                              sel!(documentPickerWasCancelled:),
+                              cancelled as extern "C" fn(_, _, _),
+                          );
+                          let cls = builder.register();
+                          let obj: *mut AnyObject = msg_send![cls, new];
+                          obj as usize
+                      }
+                  });
+                  addr as *mut AnyObject
+              }
+
+              unsafe fn nsstring(s: &str) -> *mut AnyObject {
+                  let c = CString::new(s).unwrap();
+                  msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()]
+              }
+
+              unsafe fn top_view_controller() -> *mut AnyObject {
+                  let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+                  if app.is_null() {
+                      return std::ptr::null_mut();
+                  }
+                  let windows: *mut AnyObject = msg_send![app, windows];
+                  if windows.is_null() {
+                      return std::ptr::null_mut();
+                  }
+                  let count: usize = msg_send![windows, count];
+                  let mut root: *mut AnyObject = std::ptr::null_mut();
+                  let mut first: *mut AnyObject = std::ptr::null_mut();
+                  for i in 0..count {
+                      let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                      if w.is_null() {
+                          continue;
+                      }
+                      let vc: *mut AnyObject = msg_send![w, rootViewController];
+                      if vc.is_null() {
+                          continue;
+                      }
+                      if first.is_null() {
+                          first = vc;
+                      }
+                      let is_key: bool = msg_send![w, isKeyWindow];
+                      if is_key {
+                          root = vc;
+                          break;
+                      }
+                  }
+                  if root.is_null() {
+                      root = first;
+                  }
+                  while !root.is_null() {
+                      let presented: *mut AnyObject = msg_send![root, presentedViewController];
+                      if presented.is_null() {
+                          break;
+                      }
+                      root = presented;
+                  }
+                  root
+              }
+
+              unsafe fn make_picker(folder: bool) -> *mut AnyObject {
+                  let ident = if folder { "public.folder" } else { "public.item" };
+                  let ident_ns = nsstring(ident);
+                  if let Some(utt) = AnyClass::get("UTType") {
+                      let t: *mut AnyObject = msg_send![utt, typeWithIdentifier: ident_ns];
+                      if !t.is_null() {
+                          let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: t];
+                          let alloc: *mut AnyObject = msg_send![class!(UIDocumentPickerViewController), alloc];
+                          let p: *mut AnyObject = msg_send![alloc, initForOpeningContentTypes: arr, asCopy: false];
+                          if !p.is_null() {
+                              return p;
+                          }
+                      }
+                  }
+                  let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: ident_ns];
+                  let alloc: *mut AnyObject = msg_send![class!(UIDocumentPickerViewController), alloc];
+                  let ok: bool = msg_send![alloc, respondsToSelector: sel!(initWithDocumentTypes:inMode:)];
+                  if !ok {
+                      return std::ptr::null_mut();
+                  }
+                  msg_send![alloc, initWithDocumentTypes: arr, inMode: 1usize]
+              }
+
+              unsafe fn present(folder: bool) -> bool {
+                  let is_main: bool = msg_send![class!(NSThread), isMainThread];
+                  if !is_main {
+                      return false;
+                  }
+                  let root = top_view_controller();
+                  if root.is_null() {
+                      return false;
+                  }
+                  let already: bool = msg_send![root, isKindOfClass: class!(UIDocumentPickerViewController)];
+                  if already {
+                      return false;
+                  }
+                  FOLDER_MODE.store(folder, Ordering::SeqCst);
+                  let picker = make_picker(folder);
+                  if picker.is_null() {
+                      return false;
+                  }
+                  let del = delegate();
+                  let _: () = msg_send![picker, setDelegate: del];
+                  let _: () = msg_send![root, presentViewController: picker, animated: true, completion: std::ptr::null_mut::<AnyObject>()];
+                  true
+              }
+
+              pub fn show_picker(folder: bool) {
+                  let _ = unsafe { present(folder) };
+              }
+          }
+
+          #[cfg(feature = "picker")]
+          fn take_open(_exts: &[String]) -> Option<PathBuf> {
+              if let Some(p) = ios_picker::PENDING_FILE.lock().unwrap().take() {
+                  return Some(p);
+              }
+              ios_picker::show_picker(false);
+              None
+          }
+
+          #[cfg(not(feature = "picker"))]
+          fn take_open(exts: &[String]) -> Option<PathBuf> {
+              newest_matching(exts)
+          }
+
+          #[cfg(feature = "picker")]
+          fn take_folder() -> Option<PathBuf> {
+              if let Some(p) = ios_picker::PENDING_FOLDER.lock().unwrap().take() {
+                  return Some(p);
+              }
+              ios_picker::show_picker(true);
+              None
+          }
+
+          #[cfg(not(feature = "picker"))]
+          fn take_folder() -> Option<PathBuf> {
+              Some(docs_dir())
+          }
+
+          fn take_save(name: &str, exts: &[String]) -> Option<PathBuf> {
+              take_folder().map(|dir| dir.join(save_name(name, exts)))
           }
 
           #[derive(Default, Clone, Debug)]
@@ -143,11 +358,11 @@ jobs:
               pub fn set_title(self, _title: impl Into<String>) -> Self { self }
               pub fn set_can_create_directories(self, _value: bool) -> Self { self }
               pub fn set_parent<W: ?Sized>(self, _parent: &W) -> Self { self }
-              pub fn pick_file(self) -> Option<PathBuf> { newest_matching(&self.exts) }
-              pub fn pick_files(self) -> Option<Vec<PathBuf>> { newest_matching(&self.exts).map(|p| vec![p]) }
-              pub fn pick_folder(self) -> Option<PathBuf> { Some(docs_dir()) }
-              pub fn pick_folders(self) -> Option<Vec<PathBuf>> { Some(vec![docs_dir()]) }
-              pub fn save_file(self) -> Option<PathBuf> { Some(save_path(&self.file_name, &self.exts)) }
+              pub fn pick_file(self) -> Option<PathBuf> { take_open(&self.exts) }
+              pub fn pick_files(self) -> Option<Vec<PathBuf>> { take_open(&self.exts).map(|p| vec![p]) }
+              pub fn pick_folder(self) -> Option<PathBuf> { take_folder() }
+              pub fn pick_folders(self) -> Option<Vec<PathBuf>> { take_folder().map(|p| vec![p]) }
+              pub fn save_file(self) -> Option<PathBuf> { take_save(&self.file_name, &self.exts) }
           }
 
           #[derive(Clone, Debug)]
@@ -191,23 +406,23 @@ jobs:
               pub fn set_can_create_directories(self, _value: bool) -> Self { self }
               pub fn set_parent<W: ?Sized>(self, _parent: &W) -> Self { self }
               pub fn pick_file(&self) -> impl Future<Output = Option<FileHandle>> {
-                  let result = newest_matching(&self.exts).map(FileHandle::from);
+                  let result = take_open(&self.exts).map(FileHandle::from);
                   async move { result }
               }
               pub fn pick_files(&self) -> impl Future<Output = Option<Vec<FileHandle>>> {
-                  let result = newest_matching(&self.exts).map(|p| vec![FileHandle::from(p)]);
+                  let result = take_open(&self.exts).map(|p| vec![FileHandle::from(p)]);
                   async move { result }
               }
               pub fn pick_folder(&self) -> impl Future<Output = Option<FileHandle>> {
-                  let result = Some(FileHandle::from(docs_dir()));
+                  let result = take_folder().map(FileHandle::from);
                   async move { result }
               }
               pub fn pick_folders(&self) -> impl Future<Output = Option<Vec<FileHandle>>> {
-                  let result = Some(vec![FileHandle::from(docs_dir())]);
+                  let result = take_folder().map(|p| vec![FileHandle::from(p)]);
                   async move { result }
               }
               pub fn save_file(&self) -> impl Future<Output = Option<FileHandle>> {
-                  let result = Some(FileHandle::from(save_path(&self.file_name, &self.exts)));
+                  let result = take_save(&self.file_name, &self.exts).map(FileHandle::from);
                   async move { result }
               }
           }
@@ -267,6 +482,7 @@ jobs:
               }
           }
           EOF
+          cp "$HOME/rfd-picker/src/lib.rs" "$HOME/rfd-simple/src/lib.rs"
 
       - name: Patch DeckCraft for iPad (startup code, window size, title bar)
         run: |
@@ -296,14 +512,20 @@ jobs:
           fi
           grep -n -B1 -A1 "DECKCRAFT-IOS-PATCH" "$F" || echo "WARNING: safe-area patch anchor not found"
 
-      - name: Write hardware keyboard patch for winit (iPad keyboard shortcuts)
+      - name: Back up winit view.rs
         run: |
           W=$(ls -d ~/.cargo/git/checkouts/winit-*/*/ | head -1)
           V="${W}src/platform_impl/ios/view.rs"
           echo "WINIT_VIEW=$V" >> "$GITHUB_ENV"
+          [ -f "$V.orig" ] || cp "$V" "$V.orig"
+          echo "--- does winit already define these? ---"
+          grep -c "didMoveToWindow" "$V.orig" || true
+          grep -c "willMoveToWindow" "$V.orig" || true
 
-          # part 1: methods that go inside winit's view class
-          cat > "$HOME/kbd_methods.rs" <<'EOF'
+      - name: Write keyboard and right-click patch pieces
+        run: |
+          # piece 1: opening of the extra method block plus the hardware key methods
+          cat > "$HOME/kbd_open.rs" <<'EOF'
           // DECKCRAFT-KBD-METHODS
               unsafe impl WinitView {
                   #[method(pressesBegan:withEvent:)]
@@ -326,11 +548,8 @@ jobs:
                   }
           EOF
 
-          # part 2: ask for keyboard focus when the view appears (skipped if winit already does it)
-          if grep -q "didMoveToWindow" "$V"; then
-            echo "winit already handles didMoveToWindow, skipping that method"
-          else
-            cat >> "$HOME/kbd_methods.rs" <<'EOF'
+          # piece 2: ask for keyboard focus when the view appears (only used if winit does not already)
+          cat > "$HOME/kbd_didmove.rs" <<'EOF'
 
                   #[method(didMoveToWindow)]
                   fn deckcraft_did_move_to_window(&self) {
@@ -340,10 +559,25 @@ jobs:
                       }
                   }
           EOF
-          fi
-          printf '    }\n\n' >> "$HOME/kbd_methods.rs"
 
-          # part 3: helper functions added at the end of view.rs
+          # piece 3: right-click methods (only used if winit does not already define willMoveToWindow)
+          cat > "$HOME/rc_methods.rs" <<'EOF'
+
+                  #[method(willMoveToWindow:)]
+                  fn deckcraft_will_move_to_window(&self, new_window: *mut objc2::runtime::AnyObject) {
+                      let _: () = unsafe { msg_send![super(self), willMoveToWindow: new_window] };
+                      if !new_window.is_null() {
+                          deckcraft_attach_right_click(self);
+                      }
+                  }
+
+                  #[method(deckcraftRightClick:)]
+                  fn deckcraft_right_click(&self, recognizer: &UIGestureRecognizer) {
+                      deckcraft_send_right_click(self, recognizer);
+                  }
+          EOF
+
+          # piece 4: helper functions for the keyboard, added at the end of view.rs
           cat > "$HOME/kbd_helper.rs" <<'EOF'
 
           // DECKCRAFT-KBD-HELPER
@@ -401,6 +635,7 @@ jobs:
                   80 => (KeyCode::ArrowLeft, Some(NamedKey::ArrowLeft)),
                   81 => (KeyCode::ArrowDown, Some(NamedKey::ArrowDown)),
                   82 => (KeyCode::ArrowUp, Some(NamedKey::ArrowUp)),
+                  88 => (KeyCode::NumpadEnter, Some(NamedKey::Enter)),
                   _ => return None,
               })
           }
@@ -416,6 +651,7 @@ jobs:
 
           // Turns hardware keyboard presses into winit events. Returns true when a key was
           // handled here (so UIKit should not process it again).
+          // Only the Command key counts as the shortcut key (reported to egui as Control).
           fn deckcraft_hardware_keys(view: &WinitView, presses: &objc2::runtime::AnyObject, began: bool) -> bool {
               use objc2::runtime::AnyObject;
               let window = match view.window() {
@@ -456,13 +692,11 @@ jobs:
                   };
 
                   let mut cmd = flags & 0x100000 != 0;
-                  let mut ctrl = flags & 0x40000 != 0;
                   let mut alt = flags & 0x80000 != 0;
                   let mut shift = flags & 0x20000 != 0;
                   let is_modifier = (224..=231).contains(&hid);
                   if is_modifier {
                       match hid {
-                          224 | 228 => ctrl = began,
                           225 | 229 => shift = began,
                           226 | 230 => alt = began,
                           227 | 231 => cmd = began,
@@ -470,8 +704,6 @@ jobs:
                       }
                   }
 
-                  // egui treats Control as its Command key on non-Mac systems, so the iPad
-                  // Command key is reported as Control.
                   let mut mods = crate::keyboard::ModifiersState::default();
                   if shift {
                       mods |= crate::keyboard::ModifiersState::SHIFT;
@@ -479,7 +711,7 @@ jobs:
                   if alt {
                       mods |= crate::keyboard::ModifiersState::ALT;
                   }
-                  if ctrl || cmd {
+                  if cmd {
                       mods |= crate::keyboard::ModifiersState::CONTROL;
                   }
                   events.push(EventWrapper::StaticEvent(Event::WindowEvent {
@@ -489,10 +721,10 @@ jobs:
 
                   if began && !is_modifier {
                       if let Some((code, named)) = deckcraft_hid_key(hid) {
-                          // Return, Backspace, Tab and Space are left to UIKit unless Command or
-                          // Control is held; arrows, Escape, F-keys, Home/End etc. are always handled here.
-                          let special = named.is_some() && !matches!(hid, 40 | 42 | 43 | 44);
-                          if special || cmd || ctrl {
+                          // Backspace and Space are left to UIKit (typing already works) unless Command
+                          // is held. Enter, Tab, arrows, Escape, F-keys, Home/End etc. are always handled here.
+                          let special = named.is_some() && !matches!(hid, 42 | 44);
+                          if special || cmd {
                               let logical_key: Option<Key> = match named {
                                   Some(n) => Some(Key::Named(n)),
                                   None => {
@@ -541,58 +773,153 @@ jobs:
           }
           EOF
 
-      - name: Apply hardware keyboard patch to winit
-        run: |
-          V="$WINIT_VIEW"
-          [ -f "$V.orig" ] || cp "$V" "$V.orig"
-          if grep -q "DECKCRAFT-KBD" "$V"; then
-            echo "already patched"
-          else
-            perl -0pi -e 'BEGIN { open(my $fh, "<", "$ENV{HOME}/kbd_methods.rs") or die; local $/; $ins = <$fh>; close $fh; } s/(\n[ \t]*unsafe impl UIKeyInput for WinitView \{)/\n$ins$1/' "$V"
-            cat "$HOME/kbd_helper.rs" >> "$V"
-          fi
-          echo "--- patch markers found in view.rs (expect 2 lines) ---"
-          grep -n "DECKCRAFT-KBD" "$V" || echo "WARNING: keyboard patch anchor not found"
+          # piece 5: helper functions for right-click, added at the end of view.rs
+          cat > "$HOME/rc_helper.rs" <<'EOF'
 
-      - name: Build for iPad (with keyboard patch)
-        id: build_kbd
-        continue-on-error: true
+          // DECKCRAFT-RC-HELPER
+          static DECKCRAFT_RC_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+          // Listens for the secondary mouse button (or two-finger trackpad click).
+          fn deckcraft_attach_right_click(view: &WinitView) {
+              use objc2::runtime::AnyObject;
+              if DECKCRAFT_RC_ATTACHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                  return;
+              }
+              unsafe {
+                  let alloc: *mut AnyObject = objc2::msg_send![objc2::class!(UITapGestureRecognizer), alloc];
+                  let rec: *mut AnyObject = objc2::msg_send![alloc, initWithTarget: view, action: objc2::sel!(deckcraftRightClick:)];
+                  if rec.is_null() {
+                      return;
+                  }
+                  let ok: bool = objc2::msg_send![rec, respondsToSelector: objc2::sel!(setButtonMaskRequired:)];
+                  if !ok {
+                      return;
+                  }
+                  let _: () = objc2::msg_send![rec, setButtonMaskRequired: 2usize];
+                  let number: *mut AnyObject = objc2::msg_send![objc2::class!(NSNumber), numberWithInteger: 3isize];
+                  let types: *mut AnyObject = objc2::msg_send![objc2::class!(NSArray), arrayWithObject: number];
+                  let _: () = objc2::msg_send![rec, setAllowedTouchTypes: types];
+                  let _: () = objc2::msg_send![view, addGestureRecognizer: rec];
+              }
+          }
+
+          fn deckcraft_send_right_click(view: &WinitView, recognizer: &UIGestureRecognizer) {
+              let window = match view.window() {
+                  Some(window) => window,
+                  None => return,
+              };
+              let window_id = RootWindowId(window.id());
+              let mtm = MainThreadMarker::new().unwrap();
+              let point: CGPoint = unsafe { objc2::msg_send![recognizer, locationInView: view] };
+              let scale = view.contentScaleFactor() as f64;
+              let position = crate::dpi::PhysicalPosition::new(point.x as f64 * scale, point.y as f64 * scale);
+              let mut events: Vec<EventWrapper> = Vec::new();
+              events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                  window_id,
+                  event: WindowEvent::CursorMoved { device_id: DEVICE_ID, position },
+              }));
+              for state in [ElementState::Pressed, ElementState::Released] {
+                  events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                      window_id,
+                      event: WindowEvent::MouseInput {
+                          device_id: DEVICE_ID,
+                          state,
+                          button: crate::event::MouseButton::Right,
+                      },
+                  }));
+              }
+              app_state::handle_nonuser_events(mtm, events);
+          }
+          EOF
+
+      - name: Build for iPad (drops any patch that fails to compile, then retries)
         run: |
           set -o pipefail
-          cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$HOME/rfd-stub'" 2>&1 | tee "$HOME/kbd-build.log"
+          V="$WINIT_VIEW"
+          RC=1; PK=1; KB=1; OK=0; HAVE_RC=0
 
-      - name: Patch did not compile - remove patches and rebuild
-        if: steps.build_kbd.outcome == 'failure'
-        run: |
-          echo "=============== COMPILE ERRORS FROM THE PATCHED BUILD (send me these) ==============="
-          grep -A16 -E "^error" "$HOME/kbd-build.log" | head -160 || true
-          echo "===================================================================================="
-          cp "$WINIT_VIEW.orig" "$WINIT_VIEW"
-          cp "$EGUI_WINIT_LIB.orig" "$EGUI_WINIT_LIB"
-          cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$HOME/rfd-stub'"
+          apply_winit() {
+            cp "$V.orig" "$V"
+            HAVE_RC=0
+            if [ "$KB" = "1" ]; then
+              cat "$HOME/kbd_open.rs" > "$HOME/kbd_methods.rs"
+              if ! grep -q "didMoveToWindow" "$V"; then
+                cat "$HOME/kbd_didmove.rs" >> "$HOME/kbd_methods.rs"
+              fi
+              if [ "$RC" = "1" ] && ! grep -q "willMoveToWindow" "$V"; then
+                cat "$HOME/rc_methods.rs" >> "$HOME/kbd_methods.rs"
+                HAVE_RC=1
+              fi
+              printf '    }\n\n' >> "$HOME/kbd_methods.rs"
+              perl -0pi -e 'BEGIN { open(my $fh, "<", "$ENV{HOME}/kbd_methods.rs") or die; local $/; $ins = <$fh>; close $fh; } s/(\n[ \t]*unsafe impl UIKeyInput for WinitView \{)/\n$ins$1/' "$V"
+              cat "$HOME/kbd_helper.rs" >> "$V"
+              if [ "$HAVE_RC" = "1" ]; then
+                cat "$HOME/rc_helper.rs" >> "$V"
+              fi
+              grep -n "DECKCRAFT-" "$V" || echo "WARNING: patch markers not found"
+            fi
+          }
+
+          for attempt in 1 2 3 4; do
+            echo "=== attempt $attempt: keyboard=$KB right-click=$RC file-picker=$PK ==="
+            apply_winit
+            if [ "$PK" = "1" ]; then STUB="$HOME/rfd-picker"; else STUB="$HOME/rfd-simple"; fi
+            LOG="$HOME/build-$attempt.log"
+            if cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$STUB'" 2>&1 | tee "$LOG"; then
+              OK=1
+              break
+            fi
+            echo "=============== COMPILE ERRORS, attempt $attempt (send me these if the final build fails) ==============="
+            grep -A14 -E "^error" "$LOG" | head -100 || true
+            echo "================================================================================================="
+            CHANGED=0
+            if [ "$PK" = "1" ] && grep -q 'could not compile `rfd`' "$LOG"; then
+              PK=0; CHANGED=1
+            fi
+            if grep -q 'could not compile `winit`' "$LOG"; then
+              if [ "$RC" = "1" ]; then
+                RC=0; CHANGED=1
+              elif [ "$KB" = "1" ]; then
+                KB=0; CHANGED=1
+              fi
+            fi
+            if [ "$CHANGED" = "0" ]; then
+              if [ "$PK" = "1" ]; then
+                PK=0; CHANGED=1
+              elif [ "$RC" = "1" ]; then
+                RC=0; CHANGED=1
+              elif [ "$KB" = "1" ]; then
+                KB=0; CHANGED=1
+              fi
+            fi
+            if [ "$CHANGED" = "0" ]; then
+              break
+            fi
+          done
+
+          echo "success=$OK keyboard-patch=$KB right-click-requested=$RC right-click-code-included=$HAVE_RC file-picker=$PK" | tee "$HOME/final.txt"
+          if [ "$OK" != "1" ]; then
+            exit 1
+          fi
 
       - name: Summary
         if: always()
         run: |
-          echo "Build with keyboard and safe-area patches: ${{ steps.build_kbd.outcome }}"
-          echo "(success = patches are in this IPA; failure = IPA was rebuilt WITHOUT the patches)"
+          echo "=============== WHAT IS IN THIS IPA ==============="
+          cat "$HOME/final.txt" || echo "build did not finish"
+          echo "file-picker=1 means the Files app picker is included, 0 means the simple Documents-folder version"
+          echo "keyboard-patch=1 means hardware keyboard support is included"
+          echo "right-click-code-included=1 means right-click support is included"
+          echo "==================================================="
 
       - name: Diagnostics for the next round
         if: always()
         continue-on-error: true
         run: |
-          V="$WINIT_VIEW"
-          D=$(dirname "$V")
-          echo "=== winit view.rs top ==="
-          sed -n '1,45p' "$V"
-          echo "=== handle_insert_text ==="
-          grep -n -A30 "fn handle_insert_text" "$V" | head -60
-          echo "=== first responder and keyboard calls in winit iOS ==="
-          grep -rn -E "FirstResponder|set_ime_allowed|ime" "$D" | head -40
-          echo "=== winit view_controller.rs ==="
-          sed -n '1,120p' "$D/view_controller.rs"
-          echo "=== egui-winit safe_area.rs ==="
-          head -80 "$(dirname "$EGUI_WINIT_LIB")/safe_area.rs"
+          echo "=== where DeckCraft calls the file dialogs ==="
+          grep -rn -B3 -A12 -E "pick_file|pick_files|save_file|pick_folder" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -250
+          echo "=== winit view.rs: first responder and keyboard focus ==="
+          grep -n -E "FirstResponder|didMoveToWindow|willMoveToWindow" "$WINIT_VIEW" | head -30
 
       - name: List build output
         run: ls -la target/aarch64-apple-ios/release/
@@ -612,8 +939,8 @@ jobs:
             <key>CFBundleName</key><string>DeckCraft</string>
             <key>CFBundleDisplayName</key><string>DeckCraft</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>3</string>
-            <key>CFBundleShortVersionString</key><string>0.3</string>
+            <key>CFBundleVersion</key><string>4</string>
+            <key>CFBundleShortVersionString</key><string>0.4</string>
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>2</integer></array>
