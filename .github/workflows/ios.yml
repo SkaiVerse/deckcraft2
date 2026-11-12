@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     steps:
@@ -22,17 +22,11 @@ jobs:
         with:
           targets: aarch64-apple-ios
 
-      - name: Speed up repeat builds
-        uses: Swatinem/rust-cache@v2
-
       - name: Remove Linux-only window code (not needed on iPad)
         run: |
           find . -name Cargo.toml -not -path "./target/*" -print0 | xargs -0 perl -0pi -e 's/"(wayland|x11)"\s*,?\s*//g'
           echo "--- anything left mentioning wayland or x11 ---"
           grep -rn --include=Cargo.toml -E "wayland|x11" . || true
-
-      - name: Show where the app uses file dialogs (for debugging)
-        run: grep -rn --include=*.rs "rfd" . | grep -v "^./target" | head -80 || true
 
       - name: Create iPad file dialog (uses the app Documents folder)
         run: |
@@ -274,34 +268,331 @@ jobs:
           }
           EOF
 
-      - name: Remove Linux-only startup code from main.rs
+      - name: Patch DeckCraft for iPad (startup code, window size, title bar)
         run: |
-          echo "--- code around the problem, before the fix ---"
-          sed -n '260,295p' apps/deckcraft/src/main.rs
-          perl -ni -e 'print unless /EventLoopBuilderExtX11|\.with_x11\(\)/' apps/deckcraft/src/main.rs
-          echo "--- code around the problem, after the fix ---"
-          sed -n '260,295p' apps/deckcraft/src/main.rs
+          # remove Linux-only X11 startup lines and the fixed 1440x900 window size
+          perl -ni -e 'print unless /EventLoopBuilderExtX11|\.with_x11\(\)|\.with_inner_size\(\[1440\.0, 900\.0\]\)/' apps/deckcraft/src/main.rs
+          # use the roomier "integrated" title bar so the iPad window buttons do not cover the toolbar
+          perl -pi -e 's/cfg!\(target_os = "macos"\)/cfg!(any(target_os = "macos", target_os = "ios"))/ if /integrated_titlebar/' apps/deckcraft/src/main.rs
+          perl -pi -e 's/(const MAC_LIGHTS_LEFT: f32 = )9\.0;/${1}33.0;/' crates/ui-egui/src/ribbon/title_bar.rs
+          echo "--- result in main.rs ---"
+          grep -n -E "integrated_titlebar|with_inner_size|with_x11|EventLoopBuilderExtX11" apps/deckcraft/src/main.rs || true
+          echo "--- result in title_bar.rs ---"
+          grep -n "MAC_LIGHTS_LEFT: f32" crates/ui-egui/src/ribbon/title_bar.rs || true
 
-      - name: Build for iPad
-        run: cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$HOME/rfd-stub'"
+      - name: Download all code the app depends on
+        run: cargo fetch --target aarch64-apple-ios
 
-      - name: Diagnostics for the screen-edge, keyboard and pointer problems
+      - name: Patch egui (refresh the screen-edge safe area on every frame)
+        run: |
+          E=$(ls -d ~/.cargo/git/checkouts/egui-*/*/ | head -1)
+          F="${E}crates/egui-winit/src/lib.rs"
+          echo "EGUI_WINIT_LIB=$F" >> "$GITHUB_ENV"
+          [ -f "$F.orig" ] || cp "$F" "$F.orig"
+          if grep -q "DECKCRAFT-IOS-PATCH" "$F"; then
+            echo "already patched"
+          else
+            perl -0pi -e 's/(pub fn take_egui_input\(&mut self, window: &Window\) -> egui::RawInput \{)/$1\n        self.egui_input_mut().safe_area_insets = Some(safe_area::get_safe_area_insets()); \/\/ DECKCRAFT-IOS-PATCH/' "$F"
+          fi
+          grep -n -B1 -A1 "DECKCRAFT-IOS-PATCH" "$F" || echo "WARNING: safe-area patch anchor not found"
+
+      - name: Write hardware keyboard patch for winit (iPad keyboard shortcuts)
+        run: |
+          W=$(ls -d ~/.cargo/git/checkouts/winit-*/*/ | head -1)
+          V="${W}src/platform_impl/ios/view.rs"
+          echo "WINIT_VIEW=$V" >> "$GITHUB_ENV"
+
+          # part 1: methods that go inside winit's view class
+          cat > "$HOME/kbd_methods.rs" <<'EOF'
+          // DECKCRAFT-KBD-METHODS
+              unsafe impl WinitView {
+                  #[method(pressesBegan:withEvent:)]
+                  fn deckcraft_presses_began(&self, presses: &objc2::runtime::AnyObject, event: Option<&objc2::runtime::AnyObject>) {
+                      if !deckcraft_hardware_keys(self, presses, true) {
+                          let _: () = unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
+                      }
+                  }
+
+                  #[method(pressesEnded:withEvent:)]
+                  fn deckcraft_presses_ended(&self, presses: &objc2::runtime::AnyObject, event: Option<&objc2::runtime::AnyObject>) {
+                      let _ = deckcraft_hardware_keys(self, presses, false);
+                      let _: () = unsafe { msg_send![super(self), pressesEnded: presses, withEvent: event] };
+                  }
+
+                  #[method(pressesCancelled:withEvent:)]
+                  fn deckcraft_presses_cancelled(&self, presses: &objc2::runtime::AnyObject, event: Option<&objc2::runtime::AnyObject>) {
+                      let _ = deckcraft_hardware_keys(self, presses, false);
+                      let _: () = unsafe { msg_send![super(self), pressesCancelled: presses, withEvent: event] };
+                  }
+          EOF
+
+          # part 2: ask for keyboard focus when the view appears (skipped if winit already does it)
+          if grep -q "didMoveToWindow" "$V"; then
+            echo "winit already handles didMoveToWindow, skipping that method"
+          else
+            cat >> "$HOME/kbd_methods.rs" <<'EOF'
+
+                  #[method(didMoveToWindow)]
+                  fn deckcraft_did_move_to_window(&self) {
+                      let _: () = unsafe { msg_send![super(self), didMoveToWindow] };
+                      if self.window().is_some() {
+                          let _: bool = unsafe { msg_send![self, becomeFirstResponder] };
+                      }
+                  }
+          EOF
+          fi
+          printf '    }\n\n' >> "$HOME/kbd_methods.rs"
+
+          # part 3: helper functions added at the end of view.rs
+          cat > "$HOME/kbd_helper.rs" <<'EOF'
+
+          // DECKCRAFT-KBD-HELPER
+          const DECKCRAFT_LETTERS: [KeyCode; 26] = [
+              KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE, KeyCode::KeyF,
+              KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL,
+              KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR,
+              KeyCode::KeyS, KeyCode::KeyT, KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX,
+              KeyCode::KeyY, KeyCode::KeyZ,
+          ];
+
+          const DECKCRAFT_DIGITS: [KeyCode; 10] = [
+              KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4, KeyCode::Digit5,
+              KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9, KeyCode::Digit0,
+          ];
+
+          const DECKCRAFT_FKEYS: [(KeyCode, NamedKey); 12] = [
+              (KeyCode::F1, NamedKey::F1), (KeyCode::F2, NamedKey::F2), (KeyCode::F3, NamedKey::F3),
+              (KeyCode::F4, NamedKey::F4), (KeyCode::F5, NamedKey::F5), (KeyCode::F6, NamedKey::F6),
+              (KeyCode::F7, NamedKey::F7), (KeyCode::F8, NamedKey::F8), (KeyCode::F9, NamedKey::F9),
+              (KeyCode::F10, NamedKey::F10), (KeyCode::F11, NamedKey::F11), (KeyCode::F12, NamedKey::F12),
+          ];
+
+          fn deckcraft_hid_key(hid: isize) -> Option<(KeyCode, Option<NamedKey>)> {
+              Some(match hid {
+                  4..=29 => (DECKCRAFT_LETTERS[(hid - 4) as usize], None),
+                  30..=39 => (DECKCRAFT_DIGITS[(hid - 30) as usize], None),
+                  40 => (KeyCode::Enter, Some(NamedKey::Enter)),
+                  41 => (KeyCode::Escape, Some(NamedKey::Escape)),
+                  42 => (KeyCode::Backspace, Some(NamedKey::Backspace)),
+                  43 => (KeyCode::Tab, Some(NamedKey::Tab)),
+                  44 => (KeyCode::Space, Some(NamedKey::Space)),
+                  45 => (KeyCode::Minus, None),
+                  46 => (KeyCode::Equal, None),
+                  47 => (KeyCode::BracketLeft, None),
+                  48 => (KeyCode::BracketRight, None),
+                  49 => (KeyCode::Backslash, None),
+                  51 => (KeyCode::Semicolon, None),
+                  52 => (KeyCode::Quote, None),
+                  53 => (KeyCode::Backquote, None),
+                  54 => (KeyCode::Comma, None),
+                  55 => (KeyCode::Period, None),
+                  56 => (KeyCode::Slash, None),
+                  58..=69 => {
+                      let (code, named) = DECKCRAFT_FKEYS[(hid - 58) as usize];
+                      (code, Some(named))
+                  }
+                  73 => (KeyCode::Insert, Some(NamedKey::Insert)),
+                  74 => (KeyCode::Home, Some(NamedKey::Home)),
+                  75 => (KeyCode::PageUp, Some(NamedKey::PageUp)),
+                  76 => (KeyCode::Delete, Some(NamedKey::Delete)),
+                  77 => (KeyCode::End, Some(NamedKey::End)),
+                  78 => (KeyCode::PageDown, Some(NamedKey::PageDown)),
+                  79 => (KeyCode::ArrowRight, Some(NamedKey::ArrowRight)),
+                  80 => (KeyCode::ArrowLeft, Some(NamedKey::ArrowLeft)),
+                  81 => (KeyCode::ArrowDown, Some(NamedKey::ArrowDown)),
+                  82 => (KeyCode::ArrowUp, Some(NamedKey::ArrowUp)),
+                  _ => return None,
+              })
+          }
+
+          fn deckcraft_hid_char(hid: isize) -> String {
+              match hid {
+                  4..=29 => ((b'a' + (hid - 4) as u8) as char).to_string(),
+                  30..=38 => ((b'1' + (hid - 30) as u8) as char).to_string(),
+                  39 => "0".to_string(),
+                  _ => String::new(),
+              }
+          }
+
+          // Turns hardware keyboard presses into winit events. Returns true when a key was
+          // handled here (so UIKit should not process it again).
+          fn deckcraft_hardware_keys(view: &WinitView, presses: &objc2::runtime::AnyObject, began: bool) -> bool {
+              use objc2::runtime::AnyObject;
+              let window = match view.window() {
+                  Some(window) => window,
+                  None => return false,
+              };
+              let window_id = RootWindowId(window.id());
+              let mtm = MainThreadMarker::new().unwrap();
+              let mut events: Vec<EventWrapper> = Vec::new();
+              let mut consumed = false;
+
+              let all: *mut AnyObject = unsafe { objc2::msg_send![presses, allObjects] };
+              if all.is_null() {
+                  return false;
+              }
+              let count: usize = unsafe { objc2::msg_send![all, count] };
+              for i in 0..count {
+                  let press: *mut AnyObject = unsafe { objc2::msg_send![all, objectAtIndex: i] };
+                  if press.is_null() {
+                      continue;
+                  }
+                  let key: *mut AnyObject = unsafe { objc2::msg_send![press, key] };
+                  if key.is_null() {
+                      continue;
+                  }
+                  let hid: isize = unsafe { objc2::msg_send![key, keyCode] };
+                  let flags: isize = unsafe { objc2::msg_send![key, modifierFlags] };
+                  let chars_obj: *mut AnyObject = unsafe { objc2::msg_send![key, charactersIgnoringModifiers] };
+                  let chars: String = if chars_obj.is_null() {
+                      String::new()
+                  } else {
+                      let utf8: *const std::os::raw::c_char = unsafe { objc2::msg_send![chars_obj, UTF8String] };
+                      if utf8.is_null() {
+                          String::new()
+                      } else {
+                          unsafe { std::ffi::CStr::from_ptr(utf8) }.to_string_lossy().into_owned()
+                      }
+                  };
+
+                  let mut cmd = flags & 0x100000 != 0;
+                  let mut ctrl = flags & 0x40000 != 0;
+                  let mut alt = flags & 0x80000 != 0;
+                  let mut shift = flags & 0x20000 != 0;
+                  let is_modifier = (224..=231).contains(&hid);
+                  if is_modifier {
+                      match hid {
+                          224 | 228 => ctrl = began,
+                          225 | 229 => shift = began,
+                          226 | 230 => alt = began,
+                          227 | 231 => cmd = began,
+                          _ => {}
+                      }
+                  }
+
+                  // egui treats Control as its Command key on non-Mac systems, so the iPad
+                  // Command key is reported as Control.
+                  let mut mods = crate::keyboard::ModifiersState::default();
+                  if shift {
+                      mods |= crate::keyboard::ModifiersState::SHIFT;
+                  }
+                  if alt {
+                      mods |= crate::keyboard::ModifiersState::ALT;
+                  }
+                  if ctrl || cmd {
+                      mods |= crate::keyboard::ModifiersState::CONTROL;
+                  }
+                  events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                      window_id,
+                      event: WindowEvent::ModifiersChanged(crate::event::Modifiers::from(mods)),
+                  }));
+
+                  if began && !is_modifier {
+                      if let Some((code, named)) = deckcraft_hid_key(hid) {
+                          // Return, Backspace, Tab and Space are left to UIKit unless Command or
+                          // Control is held; arrows, Escape, F-keys, Home/End etc. are always handled here.
+                          let special = named.is_some() && !matches!(hid, 40 | 42 | 43 | 44);
+                          if special || cmd || ctrl {
+                              let logical_key: Option<Key> = match named {
+                                  Some(n) => Some(Key::Named(n)),
+                                  None => {
+                                      let text = if chars.is_empty() {
+                                          deckcraft_hid_char(hid)
+                                      } else {
+                                          chars.to_lowercase()
+                                      };
+                                      if text.is_empty() {
+                                          None
+                                      } else {
+                                          Some(Key::Character(smol_str::SmolStr::new(text)))
+                                      }
+                                  }
+                              };
+                              if let Some(logical_key) = logical_key {
+                                  for state in [ElementState::Pressed, ElementState::Released] {
+                                      events.push(EventWrapper::StaticEvent(Event::WindowEvent {
+                                          window_id,
+                                          event: WindowEvent::KeyboardInput {
+                                              device_id: DEVICE_ID,
+                                              event: KeyEvent {
+                                                  state,
+                                                  logical_key: logical_key.clone(),
+                                                  physical_key: PhysicalKey::Code(code),
+                                                  platform_specific: KeyEventExtra {},
+                                                  repeat: false,
+                                                  location: KeyLocation::Standard,
+                                                  text: None,
+                                              },
+                                              is_synthetic: false,
+                                          },
+                                      }));
+                                  }
+                                  consumed = true;
+                              }
+                          }
+                      }
+                  }
+              }
+
+              if !events.is_empty() {
+                  app_state::handle_nonuser_events(mtm, events);
+              }
+              consumed
+          }
+          EOF
+
+      - name: Apply hardware keyboard patch to winit
+        run: |
+          V="$WINIT_VIEW"
+          [ -f "$V.orig" ] || cp "$V" "$V.orig"
+          if grep -q "DECKCRAFT-KBD" "$V"; then
+            echo "already patched"
+          else
+            perl -0pi -e 'BEGIN { open(my $fh, "<", "$ENV{HOME}/kbd_methods.rs") or die; local $/; $ins = <$fh>; close $fh; } s/(\n[ \t]*unsafe impl UIKeyInput for WinitView \{)/\n$ins$1/' "$V"
+            cat "$HOME/kbd_helper.rs" >> "$V"
+          fi
+          echo "--- patch markers found in view.rs (expect 2 lines) ---"
+          grep -n "DECKCRAFT-KBD" "$V" || echo "WARNING: keyboard patch anchor not found"
+
+      - name: Build for iPad (with keyboard patch)
+        id: build_kbd
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$HOME/rfd-stub'" 2>&1 | tee "$HOME/kbd-build.log"
+
+      - name: Patch did not compile - remove patches and rebuild
+        if: steps.build_kbd.outcome == 'failure'
+        run: |
+          echo "=============== COMPILE ERRORS FROM THE PATCHED BUILD (send me these) ==============="
+          grep -A16 -E "^error" "$HOME/kbd-build.log" | head -160 || true
+          echo "===================================================================================="
+          cp "$WINIT_VIEW.orig" "$WINIT_VIEW"
+          cp "$EGUI_WINIT_LIB.orig" "$EGUI_WINIT_LIB"
+          cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$HOME/rfd-stub'"
+
+      - name: Summary
         if: always()
         run: |
-          echo "=== winit version used ==="
-          grep -A3 'name = "winit"' Cargo.lock || true
-          echo "=== window setup in main.rs ==="
-          grep -n -E "ViewportBuilder|with_inner_size|with_decorations|with_fullsize|with_maximized|with_fullscreen|NativeOptions|pixels_per_point|scale_factor" apps/deckcraft/src/main.rs || true
-          echo "=== safe area handling in the app ==="
-          grep -rn -i "safe_area" apps crates --include=*.rs | head -20 || true
-          echo "=== safe area handling in eframe ==="
-          grep -rn -i "safe_area" ~/.cargo/git/checkouts/egui-*/*/crates --include=*.rs 2>/dev/null | head -20 || true
-          echo "=== hardware keyboard support inside winit for iOS ==="
-          grep -rln -E "pressesBegan|UIPress|KeyboardInput" ~/.cargo/git/checkouts/winit-*/*/src/platform_impl/ios 2>/dev/null || echo "no keyboard code found in winit iOS"
-          echo "=== pointer and mouse support inside winit for iOS ==="
-          grep -rln -E "UIHoverGestureRecognizer|PointerMoved|CursorMoved|indirect" ~/.cargo/git/checkouts/winit-*/*/src/platform_impl/ios 2>/dev/null || echo "no pointer code found in winit iOS"
-          echo "=== how the app reads keyboard shortcuts ==="
-          grep -rn -E "consume_shortcut|KeyboardShortcut|Modifiers::COMMAND" apps crates --include=*.rs | head -20 || true
+          echo "Build with keyboard and safe-area patches: ${{ steps.build_kbd.outcome }}"
+          echo "(success = patches are in this IPA; failure = IPA was rebuilt WITHOUT the patches)"
+
+      - name: Diagnostics for the next round
+        if: always()
+        continue-on-error: true
+        run: |
+          V="$WINIT_VIEW"
+          D=$(dirname "$V")
+          echo "=== winit view.rs top ==="
+          sed -n '1,45p' "$V"
+          echo "=== handle_insert_text ==="
+          grep -n -A30 "fn handle_insert_text" "$V" | head -60
+          echo "=== first responder and keyboard calls in winit iOS ==="
+          grep -rn -E "FirstResponder|set_ime_allowed|ime" "$D" | head -40
+          echo "=== winit view_controller.rs ==="
+          sed -n '1,120p' "$D/view_controller.rs"
+          echo "=== egui-winit safe_area.rs ==="
+          head -80 "$(dirname "$EGUI_WINIT_LIB")/safe_area.rs"
 
       - name: List build output
         run: ls -la target/aarch64-apple-ios/release/
@@ -321,8 +612,8 @@ jobs:
             <key>CFBundleName</key><string>DeckCraft</string>
             <key>CFBundleDisplayName</key><string>DeckCraft</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>2</string>
-            <key>CFBundleShortVersionString</key><string>0.2</string>
+            <key>CFBundleVersion</key><string>3</string>
+            <key>CFBundleShortVersionString</key><string>0.3</string>
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>2</integer></array>
