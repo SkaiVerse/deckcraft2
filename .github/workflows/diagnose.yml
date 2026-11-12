@@ -19,41 +19,42 @@ jobs:
       - name: Download all code the app depends on
         run: cargo fetch --target aarch64-apple-ios
 
-      - name: 1 - Where winit and eframe come from
+      - name: A - winit iPad view.rs (imports and keyboard part)
         run: |
-          grep -B1 -A4 'name = "winit"' Cargo.lock || true
-          grep -B1 -A4 'name = "eframe"' Cargo.lock || true
-          ls ~/.cargo/git/checkouts/ || true
+          W=$(ls -d ~/.cargo/git/checkouts/winit-*/*/ | head -1)
+          echo "=== lines 1-60 ==="
+          sed -n '1,60p' "$W/src/platform_impl/ios/view.rs"
+          echo "=== lines 320-375 ==="
+          sed -n '320,375p' "$W/src/platform_impl/ios/view.rs"
 
-      - name: 2 - winit iPad keyboard code
+      - name: B - winit iPad view.rs (touch and position code)
         run: |
-          for F in ~/.cargo/git/checkouts/winit-*/*/src/platform_impl/ios; do
-            echo "folder: $F"
-            ls "$F" || true
-            grep -n -E "pressesBegan|pressesEnded|UIPress|KeyboardInput|insertText|deleteBackward|modifier" "$F"/*.rs | head -60 || true
-          done
+          W=$(ls -d ~/.cargo/git/checkouts/winit-*/*/ | head -1)
+          sed -n '440,640p' "$W/src/platform_impl/ios/view.rs"
 
-      - name: 3 - winit iPad touch and position handling
+      - name: C - winit iPad window.rs (window size code)
         run: |
-          for F in ~/.cargo/git/checkouts/winit-*/*/src/platform_impl/ios; do
-            echo "folder: $F"
-            grep -n -E "touchesBegan|touchesMoved|locationInView|location_in_view|contentScaleFactor|scale_factor|hover|pointer|UITouchType|indirect" "$F/view.rs" | head -80 || true
-            echo "--- touch handler code ---"
-            grep -n -A45 "fn handle_touch" "$F/view.rs" | head -150 || true
-          done
+          W=$(ls -d ~/.cargo/git/checkouts/winit-*/*/ | head -1)
+          sed -n '495,545p' "$W/src/platform_impl/ios/window.rs"
 
-      - name: 4 - winit iPad window size and safe area
+      - name: D - winit dependencies
         run: |
-          for F in ~/.cargo/git/checkouts/winit-*/*/src/platform_impl/ios; do
-            echo "folder: $F"
-            grep -n -E "inner_size|bounds|frame\(|safe" "$F/window.rs" | head -40 || true
-            grep -n -E "safe|bounds|frame\(" "$F/view.rs" | head -40 || true
-          done
+          W=$(ls -d ~/.cargo/git/checkouts/winit-*/*/ | head -1)
+          grep -n -i -E "objc2|icrate|ios|^version" "$W/Cargo.toml" | head -60
 
-      - name: 5 - safe area handling in winit and egui (outside tests)
+      - name: E - how this repo pins winit and eframe
         run: |
-          grep -rn -i -E "safe_area|safeArea" ~/.cargo/git/checkouts/winit-*/*/src ~/.cargo/git/checkouts/egui-*/*/crates --include=*.rs | grep -v "raw_input.rs" | head -60 || true
+          grep -n -B2 -A6 -E "winit|eframe|\[patch" Cargo.toml || true
+          echo "=== apps/deckcraft/Cargo.toml ==="
+          cat apps/deckcraft/Cargo.toml
 
-      - name: 6 - how the app draws its top bar and window
+      - name: F - egui-winit keyboard, modifier and pointer handling
         run: |
-          grep -rn -i -E "TopBottomPanel|menu_bar|title_bar|titlebar|ViewportCommand|with_decorations|with_fullsize_content_view" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -60 || true
+          E=$(ls -d ~/.cargo/git/checkouts/egui-*/*/ | head -1)
+          grep -n -E "ModifiersChanged|KeyboardInput|safe_area|fn take_egui_input|fn on_window_event|Touch|CursorMoved|pixels_per_point" "$E/crates/egui-winit/src/lib.rs" | head -100
+
+      - name: G - DeckCraft window setup
+        run: sed -n '225,335p' apps/deckcraft/src/main.rs
+
+      - name: H - DeckCraft title bar
+        run: head -120 crates/ui-egui/src/ribbon/title_bar.rs
