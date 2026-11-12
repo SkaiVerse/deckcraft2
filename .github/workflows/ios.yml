@@ -34,7 +34,7 @@ jobs:
       - name: Show where the app uses file dialogs (for debugging)
         run: grep -rn --include=*.rs "rfd" . | grep -v "^./target" | head -80 || true
 
-      - name: Create do-nothing stand-in for the file dialog library
+      - name: Create iPad file dialog (uses the app Documents folder)
         run: |
           mkdir -p "$HOME/rfd-stub/src"
           cat > "$HOME/rfd-stub/Cargo.toml" <<'EOF'
@@ -42,7 +42,7 @@ jobs:
           name = "rfd"
           version = "0.17.2"
           edition = "2021"
-          description = "Stand-in for iPad builds"
+          description = "iPad replacement: files live in the app Documents folder"
 
           [features]
           default = []
@@ -54,26 +54,106 @@ jobs:
           file-handle-inner = []
           EOF
           cat > "$HOME/rfd-stub/src/lib.rs" <<'EOF'
-          //! Stand-in for the rfd crate on iPad: every dialog does nothing.
+          //! iPad replacement for the rfd crate.
+          //! Open: picks the newest matching file in the app Documents folder.
+          //! Save: writes into the app Documents folder.
           use std::future::Future;
           use std::path::{Path, PathBuf};
 
+          fn docs_dir() -> PathBuf {
+              let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+              let dir = PathBuf::from(home).join("Documents");
+              let _ = std::fs::create_dir_all(&dir);
+              dir
+          }
+
+          fn clean_exts(exts: &[String]) -> Vec<String> {
+              exts.iter()
+                  .map(|e| e.trim().trim_start_matches("*.").trim_start_matches('.').to_lowercase())
+                  .filter(|e| !e.is_empty() && e != "*")
+                  .collect()
+          }
+
+          fn newest_matching(exts: &[String]) -> Option<PathBuf> {
+              let exts = clean_exts(exts);
+              let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+              let entries = std::fs::read_dir(docs_dir()).ok()?;
+              for entry in entries.flatten() {
+                  let path = entry.path();
+                  if !path.is_file() {
+                      continue;
+                  }
+                  let hidden = path
+                      .file_name()
+                      .map(|n| n.to_string_lossy().starts_with('.'))
+                      .unwrap_or(false);
+                  if hidden {
+                      continue;
+                  }
+                  if !exts.is_empty() {
+                      let ext = path
+                          .extension()
+                          .map(|e| e.to_string_lossy().to_lowercase())
+                          .unwrap_or_default();
+                      if !exts.contains(&ext) {
+                          continue;
+                      }
+                  }
+                  let modified = entry
+                      .metadata()
+                      .and_then(|m| m.modified())
+                      .unwrap_or(std::time::UNIX_EPOCH);
+                  let is_newer = match &best {
+                      Some((t, _)) => modified > *t,
+                      None => true,
+                  };
+                  if is_newer {
+                      best = Some((modified, path));
+                  }
+              }
+              best.map(|(_, p)| p)
+          }
+
+          fn save_path(name: &str, exts: &[String]) -> PathBuf {
+              let exts = clean_exts(exts);
+              let mut name = if name.trim().is_empty() {
+                  "Untitled".to_string()
+              } else {
+                  name.trim().to_string()
+              };
+              if Path::new(&name).extension().is_none() {
+                  if let Some(first) = exts.first() {
+                      name = format!("{}.{}", name, first);
+                  }
+              }
+              docs_dir().join(name)
+          }
+
           #[derive(Default, Clone, Debug)]
-          pub struct FileDialog;
+          pub struct FileDialog {
+              exts: Vec<String>,
+              file_name: String,
+          }
 
           impl FileDialog {
-              pub fn new() -> Self { Self }
-              pub fn add_filter(self, _name: impl Into<String>, _extensions: &[impl ToString]) -> Self { self }
+              pub fn new() -> Self { Self::default() }
+              pub fn add_filter(mut self, _name: impl Into<String>, extensions: &[impl ToString]) -> Self {
+                  self.exts.extend(extensions.iter().map(|e| e.to_string()));
+                  self
+              }
               pub fn set_directory<P: AsRef<Path>>(self, _path: P) -> Self { self }
-              pub fn set_file_name(self, _name: impl Into<String>) -> Self { self }
+              pub fn set_file_name(mut self, name: impl Into<String>) -> Self {
+                  self.file_name = name.into();
+                  self
+              }
               pub fn set_title(self, _title: impl Into<String>) -> Self { self }
               pub fn set_can_create_directories(self, _value: bool) -> Self { self }
               pub fn set_parent<W: ?Sized>(self, _parent: &W) -> Self { self }
-              pub fn pick_file(self) -> Option<PathBuf> { None }
-              pub fn pick_files(self) -> Option<Vec<PathBuf>> { None }
-              pub fn pick_folder(self) -> Option<PathBuf> { None }
-              pub fn pick_folders(self) -> Option<Vec<PathBuf>> { None }
-              pub fn save_file(self) -> Option<PathBuf> { None }
+              pub fn pick_file(self) -> Option<PathBuf> { newest_matching(&self.exts) }
+              pub fn pick_files(self) -> Option<Vec<PathBuf>> { newest_matching(&self.exts).map(|p| vec![p]) }
+              pub fn pick_folder(self) -> Option<PathBuf> { Some(docs_dir()) }
+              pub fn pick_folders(self) -> Option<Vec<PathBuf>> { Some(vec![docs_dir()]) }
+              pub fn save_file(self) -> Option<PathBuf> { Some(save_path(&self.file_name, &self.exts)) }
           }
 
           #[derive(Clone, Debug)]
@@ -97,21 +177,45 @@ jobs:
           }
 
           #[derive(Default, Clone, Debug)]
-          pub struct AsyncFileDialog;
+          pub struct AsyncFileDialog {
+              exts: Vec<String>,
+              file_name: String,
+          }
 
           impl AsyncFileDialog {
-              pub fn new() -> Self { Self }
-              pub fn add_filter(self, _name: impl Into<String>, _extensions: &[impl ToString]) -> Self { self }
+              pub fn new() -> Self { Self::default() }
+              pub fn add_filter(mut self, _name: impl Into<String>, extensions: &[impl ToString]) -> Self {
+                  self.exts.extend(extensions.iter().map(|e| e.to_string()));
+                  self
+              }
               pub fn set_directory<P: AsRef<Path>>(self, _path: P) -> Self { self }
-              pub fn set_file_name(self, _name: impl Into<String>) -> Self { self }
+              pub fn set_file_name(mut self, name: impl Into<String>) -> Self {
+                  self.file_name = name.into();
+                  self
+              }
               pub fn set_title(self, _title: impl Into<String>) -> Self { self }
               pub fn set_can_create_directories(self, _value: bool) -> Self { self }
               pub fn set_parent<W: ?Sized>(self, _parent: &W) -> Self { self }
-              pub fn pick_file(&self) -> impl Future<Output = Option<FileHandle>> { async { None } }
-              pub fn pick_files(&self) -> impl Future<Output = Option<Vec<FileHandle>>> { async { None } }
-              pub fn pick_folder(&self) -> impl Future<Output = Option<FileHandle>> { async { None } }
-              pub fn pick_folders(&self) -> impl Future<Output = Option<Vec<FileHandle>>> { async { None } }
-              pub fn save_file(&self) -> impl Future<Output = Option<FileHandle>> { async { None } }
+              pub fn pick_file(&self) -> impl Future<Output = Option<FileHandle>> {
+                  let result = newest_matching(&self.exts).map(FileHandle::from);
+                  async move { result }
+              }
+              pub fn pick_files(&self) -> impl Future<Output = Option<Vec<FileHandle>>> {
+                  let result = newest_matching(&self.exts).map(|p| vec![FileHandle::from(p)]);
+                  async move { result }
+              }
+              pub fn pick_folder(&self) -> impl Future<Output = Option<FileHandle>> {
+                  let result = Some(FileHandle::from(docs_dir()));
+                  async move { result }
+              }
+              pub fn pick_folders(&self) -> impl Future<Output = Option<Vec<FileHandle>>> {
+                  let result = Some(vec![FileHandle::from(docs_dir())]);
+                  async move { result }
+              }
+              pub fn save_file(&self) -> impl Future<Output = Option<FileHandle>> {
+                  let result = Some(FileHandle::from(save_path(&self.file_name, &self.exts)));
+                  async move { result }
+              }
           }
 
           #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -181,6 +285,24 @@ jobs:
       - name: Build for iPad
         run: cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$HOME/rfd-stub'"
 
+      - name: Diagnostics for the screen-edge, keyboard and pointer problems
+        if: always()
+        run: |
+          echo "=== winit version used ==="
+          grep -A3 'name = "winit"' Cargo.lock || true
+          echo "=== window setup in main.rs ==="
+          grep -n -E "ViewportBuilder|with_inner_size|with_decorations|with_fullsize|with_maximized|with_fullscreen|NativeOptions|pixels_per_point|scale_factor" apps/deckcraft/src/main.rs || true
+          echo "=== safe area handling in the app ==="
+          grep -rn -i "safe_area" apps crates --include=*.rs | head -20 || true
+          echo "=== safe area handling in eframe ==="
+          grep -rn -i "safe_area" ~/.cargo/git/checkouts/egui-*/*/crates --include=*.rs 2>/dev/null | head -20 || true
+          echo "=== hardware keyboard support inside winit for iOS ==="
+          grep -rln -E "pressesBegan|UIPress|KeyboardInput" ~/.cargo/git/checkouts/winit-*/*/src/platform_impl/ios 2>/dev/null || echo "no keyboard code found in winit iOS"
+          echo "=== pointer and mouse support inside winit for iOS ==="
+          grep -rln -E "UIHoverGestureRecognizer|PointerMoved|CursorMoved|indirect" ~/.cargo/git/checkouts/winit-*/*/src/platform_impl/ios 2>/dev/null || echo "no pointer code found in winit iOS"
+          echo "=== how the app reads keyboard shortcuts ==="
+          grep -rn -E "consume_shortcut|KeyboardShortcut|Modifiers::COMMAND" apps crates --include=*.rs | head -20 || true
+
       - name: List build output
         run: ls -la target/aarch64-apple-ios/release/
 
@@ -199,12 +321,17 @@ jobs:
             <key>CFBundleName</key><string>DeckCraft</string>
             <key>CFBundleDisplayName</key><string>DeckCraft</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>1</string>
-            <key>CFBundleShortVersionString</key><string>0.1</string>
+            <key>CFBundleVersion</key><string>2</string>
+            <key>CFBundleShortVersionString</key><string>0.2</string>
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>2</integer></array>
             <key>UILaunchScreen</key><dict/>
+            <key>UIFileSharingEnabled</key><true/>
+            <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+            <key>UIStatusBarHidden</key><true/>
+            <key>UIViewControllerBasedStatusBarAppearance</key><false/>
+            <key>UIApplicationSupportsIndirectInputEvents</key><true/>
             <key>UISupportedInterfaceOrientations~ipad</key>
             <array>
               <string>UIInterfaceOrientationLandscapeLeft</string>
