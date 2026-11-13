@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 240
+    timeout-minutes: 300
     env:
       IPHONEOS_DEPLOYMENT_TARGET: "16.0"
     steps:
@@ -54,7 +54,7 @@ jobs:
           sed 's/default = \["picker"\]/default = []/' "$HOME/rfd-picker/Cargo.toml" > "$HOME/rfd-simple/Cargo.toml"
           cat > "$HOME/rfd-picker/src/lib.rs" <<'EOF'
           //! iPad replacement for the rfd crate.
-          //! Picker version: Open uses the Files app picker (pick, then tap Open again).
+          //! Picker version: Open uses the Files app picker and hands the picked file to DeckCraft.
           //! Save writes to the app Documents folder, then offers a Files "save to" screen.
           //! Simple version: uses the app Documents folder only.
           #![allow(dead_code)]
@@ -139,23 +139,36 @@ jobs:
               use objc2::{class, msg_send, sel};
               use std::ffi::{CStr, CString};
               use std::os::raw::c_char;
-              use std::path::PathBuf;
+              use std::path::{Path, PathBuf};
               use std::sync::atomic::{AtomicBool, Ordering};
               use std::sync::{Mutex, OnceLock};
-              use std::time::{Duration, SystemTime};
+              use std::time::{Duration, Instant, SystemTime};
 
-              pub static PENDING_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+              pub static PENDING_FILE: Mutex<Option<(PathBuf, Instant)>> = Mutex::new(None);
               static EXPORT_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
               static EXPORT_MODE: AtomicBool = AtomicBool::new(false);
               static DELEGATE: OnceLock<usize> = OnceLock::new();
 
-              fn store(path: PathBuf) {
-                  *PENDING_FILE.lock().unwrap() = Some(path);
+              // A small note file that the egui patch picks up and turns into a "dropped file".
+              fn marker_path() -> PathBuf {
+                  std::env::temp_dir().join("deckcraft_open_request.txt")
               }
 
-              // Where a picked file is copied to inside the app, so it stays available and editable.
-              fn copy_target(src: &std::path::Path) -> PathBuf {
-                  let dir = super::docs_dir();
+              fn same_content(a: &Path, b: &Path) -> bool {
+                  match (std::fs::metadata(a), std::fs::metadata(b)) {
+                      (Ok(x), Ok(y)) if x.len() == y.len() => match (std::fs::read(a), std::fs::read(b)) {
+                          (Ok(p), Ok(q)) => p == q,
+                          _ => false,
+                      },
+                      _ => false,
+                  }
+              }
+
+              // Where a picked file is copied to inside the app. If an identical copy already
+              // exists it is reused, so opening the same file again does not pile up copies.
+              fn copy_target(src: &Path) -> (PathBuf, bool) {
+                  let dir = super::docs_dir().join("Opened");
+                  let _ = std::fs::create_dir_all(&dir);
                   let stem = src
                       .file_stem()
                       .map(|s| s.to_string_lossy().to_string())
@@ -166,11 +179,16 @@ jobs:
                       .unwrap_or_default();
                   let mut candidate = dir.join(format!("{}{}", stem, ext));
                   let mut n = 2;
-                  while candidate.exists() {
+                  loop {
+                      if !candidate.exists() {
+                          return (candidate, false);
+                      }
+                      if same_content(src, &candidate) {
+                          return (candidate, true);
+                      }
                       candidate = dir.join(format!("{} ({}){}", stem, n, ext));
                       n += 1;
                   }
-                  candidate
               }
 
               extern "C" fn did_pick(_this: &AnyObject, _cmd: Sel, _picker: *mut AnyObject, urls: *mut AnyObject) {
@@ -200,16 +218,56 @@ jobs:
                           return;
                       }
                       let src = PathBuf::from(CStr::from_ptr(utf8).to_string_lossy().into_owned());
-                      let dest = copy_target(&src);
-                      match std::fs::copy(&src, &dest) {
-                          Ok(_) => store(dest),
-                          Err(_) => store(src),
+                      let (dest, reuse) = copy_target(&src);
+                      let ok = reuse || std::fs::copy(&src, &dest).is_ok();
+                      let chosen = if ok { dest } else { src };
+                      let _ = std::fs::write(marker_path(), chosen.to_string_lossy().as_bytes());
+                      *PENDING_FILE.lock().unwrap() = Some((chosen, Instant::now()));
+                      // Wake the app a few times so it notices the picked file right away.
+                      let del = delegate();
+                      for delay in [0.3f64, 0.9f64, 1.8f64] {
+                          let _: () = msg_send![
+                              del,
+                              performSelector: sel!(deckcraftNudge:),
+                              withObject: std::ptr::null_mut::<AnyObject>(),
+                              afterDelay: delay
+                          ];
                       }
                   }
               }
 
               extern "C" fn cancelled(_this: &AnyObject, _cmd: Sel, _picker: *mut AnyObject) {
                   EXPORT_MODE.store(false, Ordering::SeqCst);
+              }
+
+              // Asks every window to redraw once, which makes the app run a frame.
+              extern "C" fn nudge(_this: &AnyObject, _cmd: Sel, _arg: *mut AnyObject) {
+                  unsafe {
+                      let app: *mut AnyObject = msg_send![class!(UIApplication), sharedApplication];
+                      if app.is_null() {
+                          return;
+                      }
+                      let windows: *mut AnyObject = msg_send![app, windows];
+                      if windows.is_null() {
+                          return;
+                      }
+                      let count: usize = msg_send![windows, count];
+                      for i in 0..count {
+                          let w: *mut AnyObject = msg_send![windows, objectAtIndex: i];
+                          if w.is_null() {
+                              continue;
+                          }
+                          let vc: *mut AnyObject = msg_send![w, rootViewController];
+                          if vc.is_null() {
+                              continue;
+                          }
+                          let view: *mut AnyObject = msg_send![vc, view];
+                          if view.is_null() {
+                              continue;
+                          }
+                          let _: () = msg_send![view, setNeedsDisplay];
+                      }
+                  }
               }
 
               // Runs on the main thread: shows the Files "save to" screen for the file just saved.
@@ -254,6 +312,10 @@ jobs:
                           builder.add_method(
                               sel!(deckcraftPresentExport:),
                               present_export as extern "C" fn(_, _, _),
+                          );
+                          builder.add_method(
+                              sel!(deckcraftNudge:),
+                              nudge as extern "C" fn(_, _, _),
                           );
                           let cls = builder.register();
                           let obj: *mut AnyObject = msg_send![cls, new];
@@ -434,10 +496,15 @@ jobs:
               }
           }
 
+          // Open: if a file was just picked (within 6 seconds), hand it over. This is the
+          // fallback for tapping Open a second time. Otherwise show the Files picker.
           #[cfg(feature = "picker")]
           fn take_open(_exts: &[String]) -> Option<PathBuf> {
-              if let Some(p) = ios_picker::PENDING_FILE.lock().unwrap().take() {
-                  return Some(p);
+              let pending = ios_picker::PENDING_FILE.lock().unwrap().take();
+              if let Some((path, when)) = pending {
+                  if when.elapsed() < std::time::Duration::from_secs(6) {
+                      return Some(path);
+                  }
               }
               ios_picker::show_picker();
               None
@@ -625,30 +692,23 @@ jobs:
       - name: Download all code the app depends on
         run: cargo fetch --target aarch64-apple-ios
 
-      - name: Patch egui (refresh the screen-edge safe area on every frame)
-        run: |
-          E=$(ls -d ~/.cargo/git/checkouts/egui-*/*/ | head -1)
-          F="${E}crates/egui-winit/src/lib.rs"
-          echo "EGUI_WINIT_LIB=$F" >> "$GITHUB_ENV"
-          [ -f "$F.orig" ] || cp "$F" "$F.orig"
-          if grep -q "DECKCRAFT-IOS-PATCH" "$F"; then
-            echo "already patched"
-          else
-            perl -0pi -e 's/(pub fn take_egui_input\(&mut self, window: &Window\) -> egui::RawInput \{)/$1\n        self.egui_input_mut().safe_area_insets = Some(safe_area::get_safe_area_insets()); \/\/ DECKCRAFT-IOS-PATCH/' "$F"
-          fi
-          grep -n -B1 -A1 "DECKCRAFT-IOS-PATCH" "$F" || echo "WARNING: safe-area patch anchor not found"
-
-      - name: Back up winit view.rs
+      - name: Back up winit and egui-winit source files
         run: |
           W=$(ls -d ~/.cargo/git/checkouts/winit-*/*/ | head -1)
           V="${W}src/platform_impl/ios/view.rs"
           echo "WINIT_VIEW=$V" >> "$GITHUB_ENV"
           [ -f "$V.orig" ] || cp "$V" "$V.orig"
-          echo "--- does winit already define these? ---"
+          E=$(ls -d ~/.cargo/git/checkouts/egui-*/*/ | head -1)
+          F="${E}crates/egui-winit/src/lib.rs"
+          echo "EGUI_WINIT_LIB=$F" >> "$GITHUB_ENV"
+          [ -f "$F.orig" ] || cp "$F" "$F.orig"
+          echo "--- does winit already define these? (counts) ---"
           grep -c "didMoveToWindow" "$V.orig" || true
           grep -c "willMoveToWindow" "$V.orig" || true
+          echo "--- where winit reads touch positions ---"
+          grep -n "locationInView" "$V.orig" || true
 
-      - name: Write keyboard and right-click patch pieces
+      - name: Write patch pieces
         run: |
           # piece 1: opening of the extra method block plus the hardware key methods
           cat > "$HOME/kbd_open.rs" <<'EOF'
@@ -686,16 +746,20 @@ jobs:
                   }
           EOF
 
-          # piece 3: right-click methods (only used if winit does not already define willMoveToWindow)
-          cat > "$HOME/rc_methods.rs" <<'EOF'
+          # piece 3: hook that attaches the pointer gestures when the view appears
+          cat > "$HOME/wm_methods.rs" <<'EOF'
 
                   #[method(willMoveToWindow:)]
                   fn deckcraft_will_move_to_window(&self, new_window: *mut objc2::runtime::AnyObject) {
                       let _: () = unsafe { msg_send![super(self), willMoveToWindow: new_window] };
                       if !new_window.is_null() {
-                          deckcraft_attach_right_click(self);
+                          deckcraft_attach_gestures(self);
                       }
                   }
+          EOF
+
+          # piece 4: right-click method
+          cat > "$HOME/rc_methods.rs" <<'EOF'
 
                   #[method(deckcraftRightClick:)]
                   fn deckcraft_right_click(&self, recognizer: &UIGestureRecognizer) {
@@ -703,7 +767,21 @@ jobs:
                   }
           EOF
 
-          # piece 4: helper functions for the keyboard, added at the end of view.rs
+          # piece 5: hover and scroll methods
+          cat > "$HOME/pt_methods.rs" <<'EOF'
+
+                  #[method(deckcraftHover:)]
+                  fn deckcraft_hover(&self, recognizer: &UIGestureRecognizer) {
+                      deckcraft_send_hover(self, recognizer);
+                  }
+
+                  #[method(deckcraftScroll:)]
+                  fn deckcraft_scroll(&self, recognizer: &UIGestureRecognizer) {
+                      deckcraft_send_scroll(self, recognizer);
+                  }
+          EOF
+
+          # piece 6: helper functions for the keyboard, added at the end of view.rs
           cat > "$HOME/kbd_helper.rs" <<'EOF'
 
           // DECKCRAFT-KBD-HELPER
@@ -761,7 +839,22 @@ jobs:
                   80 => (KeyCode::ArrowLeft, Some(NamedKey::ArrowLeft)),
                   81 => (KeyCode::ArrowDown, Some(NamedKey::ArrowDown)),
                   82 => (KeyCode::ArrowUp, Some(NamedKey::ArrowUp)),
+                  84 => (KeyCode::NumpadDivide, None),
+                  85 => (KeyCode::NumpadMultiply, None),
+                  86 => (KeyCode::NumpadSubtract, None),
+                  87 => (KeyCode::NumpadAdd, None),
                   88 => (KeyCode::NumpadEnter, Some(NamedKey::Enter)),
+                  89 => (KeyCode::Numpad1, None),
+                  90 => (KeyCode::Numpad2, None),
+                  91 => (KeyCode::Numpad3, None),
+                  92 => (KeyCode::Numpad4, None),
+                  93 => (KeyCode::Numpad5, None),
+                  94 => (KeyCode::Numpad6, None),
+                  95 => (KeyCode::Numpad7, None),
+                  96 => (KeyCode::Numpad8, None),
+                  97 => (KeyCode::Numpad9, None),
+                  98 => (KeyCode::Numpad0, None),
+                  99 => (KeyCode::NumpadDecimal, None),
                   _ => return None,
               })
           }
@@ -771,6 +864,13 @@ jobs:
                   4..=29 => ((b'a' + (hid - 4) as u8) as char).to_string(),
                   30..=38 => ((b'1' + (hid - 30) as u8) as char).to_string(),
                   39 => "0".to_string(),
+                  84 => "/".to_string(),
+                  85 => "*".to_string(),
+                  86 => "-".to_string(),
+                  87 => "+".to_string(),
+                  89..=97 => ((b'1' + (hid - 89) as u8) as char).to_string(),
+                  98 => "0".to_string(),
+                  99 => ".".to_string(),
                   _ => String::new(),
               }
           }
@@ -899,14 +999,14 @@ jobs:
           }
           EOF
 
-          # piece 5: helper functions for right-click, added at the end of view.rs
+          # piece 7: helper functions for right-click
           cat > "$HOME/rc_helper.rs" <<'EOF'
 
           // DECKCRAFT-RC-HELPER
           static DECKCRAFT_RC_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
           // Listens for the secondary mouse button (or two-finger trackpad click).
-          fn deckcraft_attach_right_click(view: &WinitView) {
+          fn deckcraft_attach_rc(view: &WinitView) {
               use objc2::runtime::AnyObject;
               if DECKCRAFT_RC_ATTACHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                   return;
@@ -925,6 +1025,7 @@ jobs:
                   let number: *mut AnyObject = objc2::msg_send![objc2::class!(NSNumber), numberWithInteger: 3isize];
                   let types: *mut AnyObject = objc2::msg_send![objc2::class!(NSArray), arrayWithObject: number];
                   let _: () = objc2::msg_send![rec, setAllowedTouchTypes: types];
+                  let _: () = objc2::msg_send![rec, setDelegate: view];
                   let _: () = objc2::msg_send![view, addGestureRecognizer: rec];
               }
           }
@@ -958,37 +1059,220 @@ jobs:
           }
           EOF
 
+          # piece 8: helper functions for pointer hover and scrolling
+          cat > "$HOME/pt_helper.rs" <<'EOF'
+
+          // DECKCRAFT-PT-HELPER
+          static DECKCRAFT_PT_ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+          // Attaches: pointer hover, two-finger drag scrolling, and trackpad / mouse-wheel scrolling.
+          fn deckcraft_attach_pt(view: &WinitView) {
+              use objc2::runtime::AnyObject;
+              if DECKCRAFT_PT_ATTACHED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                  return;
+              }
+              unsafe {
+                  // 1. pointer hover (mouse or trackpad moving)
+                  let alloc1: *mut AnyObject = objc2::msg_send![objc2::class!(UIHoverGestureRecognizer), alloc];
+                  let hover: *mut AnyObject = objc2::msg_send![alloc1, initWithTarget: view, action: objc2::sel!(deckcraftHover:)];
+                  if !hover.is_null() {
+                      let _: () = objc2::msg_send![hover, setDelegate: view];
+                      let _: () = objc2::msg_send![view, addGestureRecognizer: hover];
+                  }
+
+                  // 2. two fingers dragging on the screen
+                  let alloc2: *mut AnyObject = objc2::msg_send![objc2::class!(UIPanGestureRecognizer), alloc];
+                  let pan: *mut AnyObject = objc2::msg_send![alloc2, initWithTarget: view, action: objc2::sel!(deckcraftScroll:)];
+                  if !pan.is_null() {
+                      let direct: *mut AnyObject = objc2::msg_send![objc2::class!(NSNumber), numberWithInteger: 0isize];
+                      let types: *mut AnyObject = objc2::msg_send![objc2::class!(NSArray), arrayWithObject: direct];
+                      let _: () = objc2::msg_send![pan, setMinimumNumberOfTouches: 2usize];
+                      let _: () = objc2::msg_send![pan, setMaximumNumberOfTouches: 2usize];
+                      let _: () = objc2::msg_send![pan, setAllowedTouchTypes: types];
+                      let _: () = objc2::msg_send![pan, setCancelsTouchesInView: false];
+                      let _: () = objc2::msg_send![pan, setDelegate: view];
+                      let _: () = objc2::msg_send![view, addGestureRecognizer: pan];
+                  }
+
+                  // 3. mouse wheel and two-finger trackpad scrolling (no touches, only scroll events)
+                  let alloc3: *mut AnyObject = objc2::msg_send![objc2::class!(UIPanGestureRecognizer), alloc];
+                  let scroll: *mut AnyObject = objc2::msg_send![alloc3, initWithTarget: view, action: objc2::sel!(deckcraftScroll:)];
+                  if !scroll.is_null() {
+                      let ok: bool = objc2::msg_send![scroll, respondsToSelector: objc2::sel!(setAllowedScrollTypesMask:)];
+                      if ok {
+                          let none: *mut AnyObject = objc2::msg_send![objc2::class!(NSArray), array];
+                          let _: () = objc2::msg_send![scroll, setAllowedTouchTypes: none];
+                          let _: () = objc2::msg_send![scroll, setAllowedScrollTypesMask: 3isize];
+                          let _: () = objc2::msg_send![scroll, setCancelsTouchesInView: false];
+                          let _: () = objc2::msg_send![scroll, setDelegate: view];
+                          let _: () = objc2::msg_send![view, addGestureRecognizer: scroll];
+                      }
+                  }
+              }
+          }
+
+          fn deckcraft_send_hover(view: &WinitView, recognizer: &UIGestureRecognizer) {
+              let window = match view.window() {
+                  Some(window) => window,
+                  None => return,
+              };
+              let window_id = RootWindowId(window.id());
+              let mtm = MainThreadMarker::new().unwrap();
+              let state: isize = unsafe { objc2::msg_send![recognizer, state] };
+              let event = if state == 1 || state == 2 {
+                  let point: CGPoint = unsafe { objc2::msg_send![recognizer, locationInView: view] };
+                  let scale = view.contentScaleFactor() as f64;
+                  WindowEvent::CursorMoved {
+                      device_id: DEVICE_ID,
+                      position: crate::dpi::PhysicalPosition::new(point.x as f64 * scale, point.y as f64 * scale),
+                  }
+              } else if state == 3 || state == 4 {
+                  WindowEvent::CursorLeft { device_id: DEVICE_ID }
+              } else {
+                  return;
+              };
+              app_state::handle_nonuser_events(
+                  mtm,
+                  vec![EventWrapper::StaticEvent(Event::WindowEvent { window_id, event })],
+              );
+          }
+
+          fn deckcraft_send_scroll(view: &WinitView, recognizer: &UIGestureRecognizer) {
+              let window = match view.window() {
+                  Some(window) => window,
+                  None => return,
+              };
+              let window_id = RootWindowId(window.id());
+              let mtm = MainThreadMarker::new().unwrap();
+              let state: isize = unsafe { objc2::msg_send![recognizer, state] };
+              if state != 1 && state != 2 {
+                  return;
+              }
+              let delta: CGPoint = unsafe { objc2::msg_send![recognizer, translationInView: view] };
+              let zero = CGPoint { x: 0.0, y: 0.0 };
+              let _: () = unsafe { objc2::msg_send![recognizer, setTranslation: zero, inView: view] };
+              if delta.x == 0.0 && delta.y == 0.0 {
+                  return;
+              }
+              let point: CGPoint = unsafe { objc2::msg_send![recognizer, locationInView: view] };
+              let scale = view.contentScaleFactor() as f64;
+              let events = vec![
+                  EventWrapper::StaticEvent(Event::WindowEvent {
+                      window_id,
+                      event: WindowEvent::CursorMoved {
+                          device_id: DEVICE_ID,
+                          position: crate::dpi::PhysicalPosition::new(point.x as f64 * scale, point.y as f64 * scale),
+                      },
+                  }),
+                  EventWrapper::StaticEvent(Event::WindowEvent {
+                      window_id,
+                      event: WindowEvent::MouseWheel {
+                          device_id: DEVICE_ID,
+                          delta: crate::event::MouseScrollDelta::PixelDelta(crate::dpi::PhysicalPosition::new(
+                              delta.x as f64 * scale,
+                              delta.y as f64 * scale,
+                          )),
+                          phase: crate::event::TouchPhase::Moved,
+                      },
+                  }),
+              ];
+              app_state::handle_nonuser_events(mtm, events);
+          }
+          EOF
+
+          # piece 9: helper for egui-winit (picks up the file chosen in the Files picker)
+          cat > "$HOME/open_helper.rs" <<'EOF'
+
+          // DECKCRAFT-OPEN-HELPER
+          fn deckcraft_take_pending_open() -> Option<std::path::PathBuf> {
+              let marker = std::env::temp_dir().join("deckcraft_open_request.txt");
+              let text = std::fs::read_to_string(&marker).ok()?;
+              let _ = std::fs::remove_file(&marker);
+              let path = std::path::PathBuf::from(text.trim());
+              if path.as_os_str().is_empty() {
+                  None
+              } else {
+                  Some(path)
+              }
+          }
+          EOF
+
       - name: Build for iPad (drops any patch that fails to compile, then retries)
         run: |
           set -o pipefail
           V="$WINIT_VIEW"
-          RC=1; PK=1; KB=1; OK=0; HAVE_RC=0
+          F="$EGUI_WINIT_LIB"
+          KB=1; RC=1; PT=1; TL=1; OI=1; PK=1; OK=0
+          HAVE_WM=0; USE_RC=0; USE_PT=0
 
           apply_winit() {
             cp "$V.orig" "$V"
-            HAVE_RC=0
+            HAVE_WM=0; USE_RC=0; USE_PT=0
             if [ "$KB" = "1" ]; then
               cat "$HOME/kbd_open.rs" > "$HOME/kbd_methods.rs"
               if ! grep -q "didMoveToWindow" "$V"; then
                 cat "$HOME/kbd_didmove.rs" >> "$HOME/kbd_methods.rs"
               fi
-              if [ "$RC" = "1" ] && ! grep -q "willMoveToWindow" "$V"; then
-                cat "$HOME/rc_methods.rs" >> "$HOME/kbd_methods.rs"
-                HAVE_RC=1
+              if { [ "$RC" = "1" ] || [ "$PT" = "1" ]; } && ! grep -q "willMoveToWindow" "$V"; then
+                HAVE_WM=1
+                cat "$HOME/wm_methods.rs" >> "$HOME/kbd_methods.rs"
+                if [ "$RC" = "1" ]; then
+                  USE_RC=1
+                  cat "$HOME/rc_methods.rs" >> "$HOME/kbd_methods.rs"
+                fi
+                if [ "$PT" = "1" ]; then
+                  USE_PT=1
+                  cat "$HOME/pt_methods.rs" >> "$HOME/kbd_methods.rs"
+                fi
               fi
               printf '    }\n\n' >> "$HOME/kbd_methods.rs"
               perl -0pi -e 'BEGIN { open(my $fh, "<", "$ENV{HOME}/kbd_methods.rs") or die; local $/; $ins = <$fh>; close $fh; } s/(\n[ \t]*unsafe impl UIKeyInput for WinitView \{)/\n$ins$1/' "$V"
               cat "$HOME/kbd_helper.rs" >> "$V"
-              if [ "$HAVE_RC" = "1" ]; then
-                cat "$HOME/rc_helper.rs" >> "$V"
+              if [ "$HAVE_WM" = "1" ]; then
+                {
+                  echo ""
+                  echo "// DECKCRAFT-GESTURES"
+                  echo "fn deckcraft_attach_gestures(view: &WinitView) {"
+                  if [ "$USE_RC" = "1" ]; then echo "    deckcraft_attach_rc(view);"; fi
+                  if [ "$USE_PT" = "1" ]; then echo "    deckcraft_attach_pt(view);"; fi
+                  echo "}"
+                } >> "$V"
+                if [ "$USE_RC" = "1" ]; then cat "$HOME/rc_helper.rs" >> "$V"; fi
+                if [ "$USE_PT" = "1" ]; then cat "$HOME/pt_helper.rs" >> "$V"; fi
               fi
-              grep -n "DECKCRAFT-" "$V" || echo "WARNING: patch markers not found"
             fi
+            if [ "$TL" = "1" ]; then
+              perl -pi -e 's/\.locationInView\(None\)/.locationInView(Some(&**self))/g' "$V"
+              echo "touch-location lines changed: $(grep -c 'locationInView(Some(&\*\*self))' "$V" || true)"
+            fi
+            grep -n "DECKCRAFT-" "$V" || echo "(no keyboard or gesture patch markers in view.rs)"
           }
 
-          for attempt in 1 2 3 4; do
-            echo "=== attempt $attempt: keyboard=$KB right-click=$RC file-picker=$PK ==="
+          apply_egui() {
+            cp "$F.orig" "$F"
+            perl -0pi -e 's/(pub fn take_egui_input\(&mut self, window: &Window\) -> egui::RawInput \{)/$1\n        self.egui_input_mut().safe_area_insets = Some(safe_area::get_safe_area_insets()); \/\/ DECKCRAFT-IOS-PATCH/' "$F"
+            if [ "$OI" = "1" ]; then
+              perl -0pi -e 's/(\/\/ DECKCRAFT-IOS-PATCH)/$1\n        if let Some(deckcraft_path) = deckcraft_take_pending_open() { let deckcraft_name = deckcraft_path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(); self.egui_input_mut().dropped_files.push(egui::DroppedFile { path: Some(deckcraft_path), name: deckcraft_name, ..Default::default() }); } \/\/ DECKCRAFT-OPEN-PATCH/' "$F"
+              cat "$HOME/open_helper.rs" >> "$F"
+            fi
+            grep -n "DECKCRAFT-" "$F" || echo "WARNING: egui patch markers not found"
+          }
+
+          drop_first() {
+            for v in "$@"; do
+              cur=$(eval echo "\$$v")
+              if [ "$cur" = "1" ]; then
+                eval "$v=0"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          for attempt in 1 2 3 4 5 6; do
+            echo "=== attempt $attempt: keyboard=$KB right-click=$RC pointer-and-scroll=$PT click-offset-fix=$TL one-tap-open=$OI file-picker=$PK ==="
             apply_winit
+            apply_egui
             if [ "$PK" = "1" ]; then STUB="$HOME/rfd-picker"; else STUB="$HOME/rfd-simple"; fi
             LOG="$HOME/build-$attempt.log"
             if cargo build --release --target aarch64-apple-ios -p deckcraft --config "patch.crates-io.rfd.path='$STUB'" 2>&1 | tee "$LOG"; then
@@ -1002,28 +1286,21 @@ jobs:
             if [ "$PK" = "1" ] && grep -q 'could not compile `rfd`' "$LOG"; then
               PK=0; CHANGED=1
             fi
+            if [ "$OI" = "1" ] && grep -q 'could not compile `egui-winit`' "$LOG"; then
+              OI=0; CHANGED=1
+            fi
             if grep -q 'could not compile `winit`' "$LOG"; then
-              if [ "$RC" = "1" ]; then
-                RC=0; CHANGED=1
-              elif [ "$KB" = "1" ]; then
-                KB=0; CHANGED=1
-              fi
+              if drop_first PT TL RC KB; then CHANGED=1; fi
             fi
             if [ "$CHANGED" = "0" ]; then
-              if [ "$PK" = "1" ]; then
-                PK=0; CHANGED=1
-              elif [ "$RC" = "1" ]; then
-                RC=0; CHANGED=1
-              elif [ "$KB" = "1" ]; then
-                KB=0; CHANGED=1
-              fi
+              if drop_first PK PT OI TL RC KB; then CHANGED=1; fi
             fi
             if [ "$CHANGED" = "0" ]; then
               break
             fi
           done
 
-          echo "success=$OK keyboard-patch=$KB right-click-requested=$RC right-click-code-included=$HAVE_RC file-picker=$PK" | tee "$HOME/final.txt"
+          echo "success=$OK keyboard=$KB right-click-included=$USE_RC pointer-and-scroll-included=$USE_PT click-offset-fix=$TL one-tap-open=$OI file-picker=$PK" | tee "$HOME/final.txt"
           if [ "$OK" != "1" ]; then
             exit 1
           fi
@@ -1033,19 +1310,24 @@ jobs:
         run: |
           echo "=============== WHAT IS IN THIS IPA ==============="
           cat "$HOME/final.txt" || echo "build did not finish"
-          echo "file-picker=1 means the Files app picker and Save-to-Files screen are included, 0 means the simple Documents-folder version"
-          echo "keyboard-patch=1 means hardware keyboard support is included"
-          echo "right-click-code-included=1 means right-click support is included"
+          echo "keyboard=1 : hardware keyboard support (Command shortcuts, Enter, Tab, arrows, keypad)"
+          echo "right-click-included=1 : right-click listener"
+          echo "pointer-and-scroll-included=1 : hover, two-finger scrolling, trackpad and mouse-wheel scrolling"
+          echo "click-offset-fix=1 : touch positions measured from the view instead of the window"
+          echo "one-tap-open=1 : picked file is handed to DeckCraft as a dropped file"
+          echo "file-picker=1 : Files app picker and Save-to-Files screen (0 = simple Documents-folder version)"
           echo "==================================================="
 
       - name: Diagnostics for the next round
         if: always()
         continue-on-error: true
         run: |
+          echo "=== does DeckCraft handle dropped files? (needed for one-tap Open) ==="
+          grep -rn "dropped_files" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -20
+          echo "=== zoom and scroll handling in DeckCraft ==="
+          grep -rn -E "smooth_scroll_delta|zoom_delta|raw_scroll_delta|wheel_zoom|MouseWheel" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -40
           echo "=== where DeckCraft calls the file dialogs ==="
           grep -rn -B3 -A12 -E "pick_file|pick_files|save_file|pick_folder" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -250
-          echo "=== winit view.rs: first responder and keyboard focus ==="
-          grep -n -E "FirstResponder|didMoveToWindow|willMoveToWindow" "$WINIT_VIEW" | head -30
 
       - name: List build output
         run: ls -la target/aarch64-apple-ios/release/
@@ -1065,8 +1347,8 @@ jobs:
             <key>CFBundleName</key><string>DeckCraft</string>
             <key>CFBundleDisplayName</key><string>DeckCraft</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>5</string>
-            <key>CFBundleShortVersionString</key><string>0.5</string>
+            <key>CFBundleVersion</key><string>6</string>
+            <key>CFBundleShortVersionString</key><string>0.6</string>
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>2</integer></array>
