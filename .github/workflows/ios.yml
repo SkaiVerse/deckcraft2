@@ -54,8 +54,9 @@ jobs:
           sed 's/default = \["picker"\]/default = []/' "$HOME/rfd-picker/Cargo.toml" > "$HOME/rfd-simple/Cargo.toml"
           cat > "$HOME/rfd-picker/src/lib.rs" <<'EOF'
           //! iPad replacement for the rfd crate.
-          //! Picker version: opens the Files app picker (pick, then tap Open or Save again).
-          //! Simple version: uses the app Documents folder.
+          //! Picker version: Open uses the Files app picker (pick, then tap Open again).
+          //! Save writes to the app Documents folder, then offers a Files "save to" screen.
+          //! Simple version: uses the app Documents folder only.
           #![allow(dead_code)]
           #![allow(unused_imports)]
 
@@ -141,21 +142,42 @@ jobs:
               use std::path::PathBuf;
               use std::sync::atomic::{AtomicBool, Ordering};
               use std::sync::{Mutex, OnceLock};
+              use std::time::{Duration, SystemTime};
 
               pub static PENDING_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
-              pub static PENDING_FOLDER: Mutex<Option<PathBuf>> = Mutex::new(None);
-              static FOLDER_MODE: AtomicBool = AtomicBool::new(false);
+              static EXPORT_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+              static EXPORT_MODE: AtomicBool = AtomicBool::new(false);
               static DELEGATE: OnceLock<usize> = OnceLock::new();
 
               fn store(path: PathBuf) {
-                  if FOLDER_MODE.load(Ordering::SeqCst) {
-                      *PENDING_FOLDER.lock().unwrap() = Some(path);
-                  } else {
-                      *PENDING_FILE.lock().unwrap() = Some(path);
+                  *PENDING_FILE.lock().unwrap() = Some(path);
+              }
+
+              // Where a picked file is copied to inside the app, so it stays available and editable.
+              fn copy_target(src: &std::path::Path) -> PathBuf {
+                  let dir = super::docs_dir();
+                  let stem = src
+                      .file_stem()
+                      .map(|s| s.to_string_lossy().to_string())
+                      .unwrap_or_else(|| "file".to_string());
+                  let ext = src
+                      .extension()
+                      .map(|e| format!(".{}", e.to_string_lossy()))
+                      .unwrap_or_default();
+                  let mut candidate = dir.join(format!("{}{}", stem, ext));
+                  let mut n = 2;
+                  while candidate.exists() {
+                      candidate = dir.join(format!("{} ({}){}", stem, n, ext));
+                      n += 1;
                   }
+                  candidate
               }
 
               extern "C" fn did_pick(_this: &AnyObject, _cmd: Sel, _picker: *mut AnyObject, urls: *mut AnyObject) {
+                  // After a Save-to-Files screen, there is nothing to do.
+                  if EXPORT_MODE.swap(false, Ordering::SeqCst) {
+                      return;
+                  }
                   unsafe {
                       if urls.is_null() {
                           return;
@@ -169,7 +191,6 @@ jobs:
                           return;
                       }
                       let _started: bool = msg_send![url, startAccessingSecurityScopedResource];
-                      let _kept: *mut AnyObject = msg_send![url, retain];
                       let path_obj: *mut AnyObject = msg_send![url, path];
                       if path_obj.is_null() {
                           return;
@@ -178,12 +199,44 @@ jobs:
                       if utf8.is_null() {
                           return;
                       }
-                      let path = CStr::from_ptr(utf8).to_string_lossy().into_owned();
-                      store(PathBuf::from(path));
+                      let src = PathBuf::from(CStr::from_ptr(utf8).to_string_lossy().into_owned());
+                      let dest = copy_target(&src);
+                      match std::fs::copy(&src, &dest) {
+                          Ok(_) => store(dest),
+                          Err(_) => store(src),
+                      }
                   }
               }
 
-              extern "C" fn cancelled(_this: &AnyObject, _cmd: Sel, _picker: *mut AnyObject) {}
+              extern "C" fn cancelled(_this: &AnyObject, _cmd: Sel, _picker: *mut AnyObject) {
+                  EXPORT_MODE.store(false, Ordering::SeqCst);
+              }
+
+              // Runs on the main thread: shows the Files "save to" screen for the file just saved.
+              extern "C" fn present_export(_this: &AnyObject, _cmd: Sel, _arg: *mut AnyObject) {
+                  unsafe {
+                      let path = match EXPORT_PATH.lock().unwrap().clone() {
+                          Some(p) => p,
+                          None => return,
+                      };
+                      let root = top_view_controller();
+                      if root.is_null() {
+                          return;
+                      }
+                      let already: bool = msg_send![root, isKindOfClass: class!(UIDocumentPickerViewController)];
+                      if already {
+                          return;
+                      }
+                      let picker = make_export_picker(&path.to_string_lossy());
+                      if picker.is_null() {
+                          return;
+                      }
+                      EXPORT_MODE.store(true, Ordering::SeqCst);
+                      let del = delegate();
+                      let _: () = msg_send![picker, setDelegate: del];
+                      let _: () = msg_send![root, presentViewController: picker, animated: true, completion: std::ptr::null_mut::<AnyObject>()];
+                  }
+              }
 
               unsafe fn delegate() -> *mut AnyObject {
                   let addr = *DELEGATE.get_or_init(|| {
@@ -197,6 +250,10 @@ jobs:
                           builder.add_method(
                               sel!(documentPickerWasCancelled:),
                               cancelled as extern "C" fn(_, _, _),
+                          );
+                          builder.add_method(
+                              sel!(deckcraftPresentExport:),
+                              present_export as extern "C" fn(_, _, _),
                           );
                           let cls = builder.register();
                           let obj: *mut AnyObject = msg_send![cls, new];
@@ -254,15 +311,15 @@ jobs:
                   root
               }
 
-              unsafe fn make_picker(folder: bool) -> *mut AnyObject {
-                  let ident = if folder { "public.folder" } else { "public.item" };
-                  let ident_ns = nsstring(ident);
+              // Picker that hands back a COPY of the chosen file (works without special app settings).
+              unsafe fn make_open_picker() -> *mut AnyObject {
+                  let ident_ns = nsstring("public.item");
                   if let Some(utt) = AnyClass::get("UTType") {
                       let t: *mut AnyObject = msg_send![utt, typeWithIdentifier: ident_ns];
                       if !t.is_null() {
                           let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: t];
                           let alloc: *mut AnyObject = msg_send![class!(UIDocumentPickerViewController), alloc];
-                          let p: *mut AnyObject = msg_send![alloc, initForOpeningContentTypes: arr, asCopy: false];
+                          let p: *mut AnyObject = msg_send![alloc, initForOpeningContentTypes: arr, asCopy: true];
                           if !p.is_null() {
                               return p;
                           }
@@ -274,10 +331,33 @@ jobs:
                   if !ok {
                       return std::ptr::null_mut();
                   }
-                  msg_send![alloc, initWithDocumentTypes: arr, inMode: 1usize]
+                  let p: *mut AnyObject = msg_send![alloc, initWithDocumentTypes: arr, inMode: 0usize];
+                  p
               }
 
-              unsafe fn present(folder: bool) -> bool {
+              // "Save to Files" screen for one existing file.
+              unsafe fn make_export_picker(path: &str) -> *mut AnyObject {
+                  let ns_path = nsstring(path);
+                  let url: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: ns_path];
+                  if url.is_null() {
+                      return std::ptr::null_mut();
+                  }
+                  let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: url];
+                  let alloc: *mut AnyObject = msg_send![class!(UIDocumentPickerViewController), alloc];
+                  let new_api: bool = msg_send![alloc, respondsToSelector: sel!(initForExportingURLs:asCopy:)];
+                  if new_api {
+                      let p: *mut AnyObject = msg_send![alloc, initForExportingURLs: arr, asCopy: true];
+                      return p;
+                  }
+                  let old_api: bool = msg_send![alloc, respondsToSelector: sel!(initWithURLs:inMode:)];
+                  if !old_api {
+                      return std::ptr::null_mut();
+                  }
+                  let p: *mut AnyObject = msg_send![alloc, initWithURLs: arr, inMode: 2usize];
+                  p
+              }
+
+              unsafe fn present_open() -> bool {
                   let is_main: bool = msg_send![class!(NSThread), isMainThread];
                   if !is_main {
                       return false;
@@ -290,8 +370,8 @@ jobs:
                   if already {
                       return false;
                   }
-                  FOLDER_MODE.store(folder, Ordering::SeqCst);
-                  let picker = make_picker(folder);
+                  EXPORT_MODE.store(false, Ordering::SeqCst);
+                  let picker = make_open_picker();
                   if picker.is_null() {
                       return false;
                   }
@@ -301,8 +381,56 @@ jobs:
                   true
               }
 
-              pub fn show_picker(folder: bool) {
-                  let _ = unsafe { present(folder) };
+              pub fn show_picker() {
+                  let _ = unsafe { present_open() };
+              }
+
+              // Waits (in the background) until DeckCraft has finished writing the file,
+              // then asks the main thread to show the Files "save to" screen.
+              pub fn watch_and_export(path: PathBuf) {
+                  let is_main: bool = unsafe { msg_send![class!(NSThread), isMainThread] };
+                  if !is_main {
+                      return;
+                  }
+                  *EXPORT_PATH.lock().unwrap() = Some(path.clone());
+                  let del_addr = unsafe { delegate() } as usize;
+                  let start = SystemTime::now() - Duration::from_secs(1);
+                  std::thread::spawn(move || {
+                      let mut last: Option<(u64, SystemTime)> = None;
+                      let mut stable_ms: u32 = 0;
+                      for _ in 0..600 {
+                          std::thread::sleep(Duration::from_millis(200));
+                          let meta = match std::fs::metadata(&path) {
+                              Ok(m) => m,
+                              Err(_) => continue,
+                          };
+                          let modified = match meta.modified() {
+                              Ok(t) => t,
+                              Err(_) => continue,
+                          };
+                          if modified < start {
+                              continue;
+                          }
+                          let cur = (meta.len(), modified);
+                          if Some(cur) == last {
+                              stable_ms += 200;
+                          } else {
+                              stable_ms = 0;
+                              last = Some(cur);
+                          }
+                          if stable_ms >= 800 && meta.len() > 0 {
+                              unsafe {
+                                  let _: () = msg_send![
+                                      del_addr as *mut AnyObject,
+                                      performSelectorOnMainThread: sel!(deckcraftPresentExport:),
+                                      withObject: std::ptr::null_mut::<AnyObject>(),
+                                      waitUntilDone: false
+                                  ];
+                              }
+                              return;
+                          }
+                      }
+                  });
               }
           }
 
@@ -311,7 +439,7 @@ jobs:
               if let Some(p) = ios_picker::PENDING_FILE.lock().unwrap().take() {
                   return Some(p);
               }
-              ios_picker::show_picker(false);
+              ios_picker::show_picker();
               None
           }
 
@@ -320,22 +448,20 @@ jobs:
               newest_matching(exts)
           }
 
-          #[cfg(feature = "picker")]
-          fn take_folder() -> Option<PathBuf> {
-              if let Some(p) = ios_picker::PENDING_FOLDER.lock().unwrap().take() {
-                  return Some(p);
-              }
-              ios_picker::show_picker(true);
-              None
-          }
-
-          #[cfg(not(feature = "picker"))]
           fn take_folder() -> Option<PathBuf> {
               Some(docs_dir())
           }
 
+          #[cfg(feature = "picker")]
           fn take_save(name: &str, exts: &[String]) -> Option<PathBuf> {
-              take_folder().map(|dir| dir.join(save_name(name, exts)))
+              let path = docs_dir().join(save_name(name, exts));
+              ios_picker::watch_and_export(path.clone());
+              Some(path)
+          }
+
+          #[cfg(not(feature = "picker"))]
+          fn take_save(name: &str, exts: &[String]) -> Option<PathBuf> {
+              Some(docs_dir().join(save_name(name, exts)))
           }
 
           #[derive(Default, Clone, Debug)]
@@ -907,7 +1033,7 @@ jobs:
         run: |
           echo "=============== WHAT IS IN THIS IPA ==============="
           cat "$HOME/final.txt" || echo "build did not finish"
-          echo "file-picker=1 means the Files app picker is included, 0 means the simple Documents-folder version"
+          echo "file-picker=1 means the Files app picker and Save-to-Files screen are included, 0 means the simple Documents-folder version"
           echo "keyboard-patch=1 means hardware keyboard support is included"
           echo "right-click-code-included=1 means right-click support is included"
           echo "==================================================="
@@ -939,8 +1065,8 @@ jobs:
             <key>CFBundleName</key><string>DeckCraft</string>
             <key>CFBundleDisplayName</key><string>DeckCraft</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>4</string>
-            <key>CFBundleShortVersionString</key><string>0.4</string>
+            <key>CFBundleVersion</key><string>5</string>
+            <key>CFBundleShortVersionString</key><string>0.5</string>
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>2</integer></array>
