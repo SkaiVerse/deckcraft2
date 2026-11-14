@@ -1473,14 +1473,14 @@ jobs:
           }
           EOF
 
-          # piece 13: keeps content away from rounded window corners (egui-winit side)
+          # piece 13: keeps content away from rounded corners and the white bar at the bottom
           cat > "$HOME/pad_tuple.rs" <<'EOF'
 
           // DECKCRAFT-PAD-HELPER
           fn deckcraft_pad_insets(mut insets: egui::SafeAreaInsets) -> egui::SafeAreaInsets {
               insets.0.left = insets.0.left.max(12.0);
               insets.0.right = insets.0.right.max(12.0);
-              insets.0.bottom = insets.0.bottom.max(12.0);
+              insets.0.bottom = insets.0.bottom.max(26.0);
               insets
           }
           EOF
@@ -1614,6 +1614,9 @@ jobs:
               else
                 cat "$HOME/pad_plain.rs" >> "$F"
               fi
+              echo "edge padding: places where it is applied in egui-winit: $(grep -c 'deckcraft_pad_insets(' "$F" || true)" >> "$HOME/patchinfo.txt"
+            else
+              echo "edge padding: OFF" >> "$HOME/patchinfo.txt"
             fi
             grep -n "DECKCRAFT-" "$F" >> "$HOME/patchinfo.txt" || echo "(no egui-winit patch markers)" >> "$HOME/patchinfo.txt"
           }
@@ -1648,14 +1651,13 @@ jobs:
               PK=0; CHANGED=1
             fi
             if grep -q 'could not compile `egui-winit`' "$LOG"; then
-              if [ "$DG" = "1" ] && grep -q -E 'deckcraft_debug_dump|DECKCRAFT-DEBUG' "$LOG"; then
+              # the optional debug piece is dropped first, so it can never cost us the edge padding
+              if [ "$DG" = "1" ]; then
                 DG=0; CHANGED=1
               elif [ "$CP" = "2" ]; then
                 CP=1; CHANGED=1
               elif [ "$CP" = "1" ]; then
                 CP=0; CHANGED=1
-              elif [ "$DG" = "1" ]; then
-                DG=0; CHANGED=1
               fi
             fi
             if grep -q 'could not compile `winit`' "$LOG"; then
@@ -1689,15 +1691,16 @@ jobs:
         continue-on-error: true
         run: |
           {
+            echo "=== bottom panels in DeckCraft (status bar) ==="
+            grep -rn -E "Panel::bottom|TopBottomPanel::bottom" crates/ui-egui/src apps | grep -v -E "tests?\.rs|_tests\.rs" | head -20 || true
+            echo "=== does DeckCraft use the full screen rectangle? ==="
+            grep -rn -E "screen_rect\(|content_rect\(|viewport_rect|available_rect" crates/ui-egui/src apps | grep -v -E "tests?\.rs|_tests\.rs" | head -30 || true
+            echo "=== egui-winit safe_area.rs (how the screen-edge sizes are read) ==="
+            head -80 "$(dirname "$EGUI_WINIT_LIB")/safe_area.rs" || true
             echo "=== how winit computes the window size (original code) ==="
             grep -n -B2 -A9 "fn inner_size" "$WINIT_WINDOW.orig" || true
-            grep -n "safe_area_screen_space\|fn screen_frame" "$WINIT_WINDOW.orig" || true
-            echo "=== where winit reads touch positions (original code) ==="
-            grep -n "locationInView" "$WINIT_VIEW.orig" || true
             echo "=== DeckCraft message dialogs (close and save prompts) ==="
-            grep -rn -B2 -A10 "MessageDialog" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -160 || true
-            echo "=== where DeckCraft calls the file dialogs ==="
-            grep -rn -B3 -A10 -E "pick_file|pick_files|save_file|pick_folder" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -200 || true
+            grep -rn -B2 -A10 "MessageDialog" apps crates --include=*.rs | grep -v -E "tests?\.rs|_tests\.rs" | head -120 || true
           } > "$HOME/diag.txt" 2>&1
 
       - name: Build report
@@ -1721,8 +1724,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           echo "=============== WHAT IS IN THIS IPA ==============="
           cat "$HOME/final.txt" || echo "build did not finish"
+          echo "corner-padding=2 or 1 : bottom and side edges padded (0 = OFF, the padding did not make it in)"
           echo "window-size-fix=1 : winit reports the full window size, so drawing and clicks line up"
-          echo "corner-padding=2 or 1 : edges padded so rounded corners do not cut buttons (0 = off)"
           echo "debug-file=1 : deckcraft_debug.txt is written into the DeckCraft folder in Files"
           echo "mouse-buttons-included=1 : mouse and trackpad clicks, drags and right-click use exact positions"
           echo "click-repeat-included=1 : your click is repeated after you pick a file"
@@ -1747,8 +1750,8 @@ jobs:
             <key>CFBundleName</key><string>DeckCraft</string>
             <key>CFBundleDisplayName</key><string>DeckCraft</string>
             <key>CFBundlePackageType</key><string>APPL</string>
-            <key>CFBundleVersion</key><string>8</string>
-            <key>CFBundleShortVersionString</key><string>0.8</string>
+            <key>CFBundleVersion</key><string>9</string>
+            <key>CFBundleShortVersionString</key><string>0.9</string>
             <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>
             <key>MinimumOSVersion</key><string>16.0</string>
             <key>UIDeviceFamily</key><array><integer>2</integer></array>
